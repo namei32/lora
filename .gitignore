@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environments
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Dataset (NEU-DET) and derived assets
+NEU-DET/
+NEU-DET/**
+
+# Outputs and generated artifacts
+outputs/
+outputs/**
+
+# Common image/video artifacts
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tiff
+*.webp
+*.mp4
+*.avi
+
+# Logs and metadata
+*.log
+outputs/metadata/
+
+# Checkpoints and model weights
+*.safetensors
+*.ckpt
+*.pt
+
+# Temporary files
+*.tmp
+*.cache/
+

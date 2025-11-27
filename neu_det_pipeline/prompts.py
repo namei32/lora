@@ -1,0 +1,18 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List
+
+from .config import TextualInversionConfig
+
+
+@dataclass
+class PromptBuilder:
+    cfg: TextualInversionConfig
+
+    def build_prompts(self, class_tokens: Dict[str, str]) -> List[str]:
+        prompts: List[str] = []
+        for cls, token in class_tokens.items():
+            prompts.append(self.cfg.prompt_template.format(token=token, cls=cls))
+        return prompts
+

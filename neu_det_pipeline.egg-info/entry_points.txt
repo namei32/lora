@@ -1,0 +1,2 @@
+[console_scripts]
+neu-det-pipeline = neu_det_pipeline.cli:app

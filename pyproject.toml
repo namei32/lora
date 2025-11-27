@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neu-det-pipeline"
+version = "0.1.0"
+description = "NEU-DET data augmentation pipeline with textual inversion, LoRA fine-tuning, and ControlNet guidance"
+authors = [
+  { name = "GitHub Copilot" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.30.1",
+  "controlnet-aux>=0.0.8",
+  "diffusers>=0.30.0",
+  "numpy>=1.24,<2.0",
+  "omegaconf>=2.3",
+  "opencv-python>=4.8",
+  "pandas>=2.0",
+  "pillow>=10.0",
+  "rich>=13.7",
+  "safetensors>=0.4",
+  "scikit-image>=0.22",
+  "scikit-learn>=1.3",
+  "torch>=2.7.0",
+  "torchvision>=0.22.0",
+  "transformers>=4.37",
+  "tqdm>=4.66",
+  "typer>=0.9"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4"
+]
+
+[project.scripts]
+neu-det-pipeline = "neu_det_pipeline.cli:app"
+
+[tool.setuptools]
+packages = ["neu_det_pipeline"]
