@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -59,24 +60,111 @@ class LoRADataset:
 
 
 class LoRATrainer:
+    """
+    LoRA (Low-Rank Adaptation) trainer for Stable Diffusion fine-tuning.
+    
+    This implements the second component of the workflow:
+    The Stable Diffusion 1.5 generation model is fine-tuned using Low-rank 
+    adaptation (LoRA) on the defect dataset, enabling it to learn the style, 
+    texture, and other characteristics of steel defects.
+    
+    LoRA achieves efficient fine-tuning by adding low-rank update matrices 
+    to the attention layers, preserving the base model while learning 
+    domain-specific features.
+    """
     def __init__(self, cfg: LoRAConfig):
         self.cfg = cfg
 
-    def prepare_pipeline(self) -> StableDiffusionPipeline:
-        pipe = StableDiffusionPipeline.from_pretrained(self.cfg.model_id)
+    def prepare_pipeline(self, token_embeddings_dir: Path = None) -> StableDiffusionPipeline:
+        """
+        Prepare SD pipeline and load textual inversion embeddings if available.
+        
+        Args:
+            token_embeddings_dir: Directory containing textual inversion embeddings (*.pt files)
+        """
+        pipe = StableDiffusionPipeline.from_pretrained(
+            self.cfg.model_id,
+            torch_dtype=torch.float32,
+            safety_checker=None,
+            requires_safety_checker=False
+        )
         pipe.to("cuda" if torch.cuda.is_available() else "cpu")
         pipe.set_progress_bar_config(disable=True)
+        
+        # Load textual inversion embeddings if directory is provided
+        if token_embeddings_dir and token_embeddings_dir.exists():
+            self._load_textual_inversion_embeddings(pipe, token_embeddings_dir)
+        
         return pipe
+    
+    def _load_textual_inversion_embeddings(self, pipe: StableDiffusionPipeline, embeddings_dir: Path):
+        """Load all textual inversion embeddings from directory."""
+        embedding_files = list(embeddings_dir.glob("*_embedding.pt"))
+        if not embedding_files:
+            print(f"Warning: No embedding files found in {embeddings_dir}")
+            return
+        
+        print(f"Loading {len(embedding_files)} textual inversion embeddings...")
+        for emb_file in embedding_files:
+            # Extract class name from filename (e.g., "crazing_embedding.pt" -> "crazing")
+            cls_name = emb_file.stem.replace("_embedding", "")
+            token = f"<neu_{cls_name}>"
+            
+            # Load embedding (it's saved as a dict with 'token', 'embedding', 'token_id')
+            checkpoint = torch.load(emb_file, map_location=pipe.text_encoder.device)
+            
+            # Extract the actual embedding tensor
+            if isinstance(checkpoint, dict) and "embedding" in checkpoint:
+                embedding = checkpoint["embedding"]
+            else:
+                # Fallback: assume it's a raw tensor
+                embedding = checkpoint
+            
+            # Ensure embedding is on the correct device
+            embedding = embedding.to(pipe.text_encoder.device)
+            
+            # Add token to tokenizer
+            num_added = pipe.tokenizer.add_tokens(token)
+            if num_added == 0:
+                print(f"  Token {token} already exists, skipping...")
+                continue
+            
+            # Resize text encoder token embeddings
+            pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
+            
+            # Get token id and set embedding
+            token_id = pipe.tokenizer.convert_tokens_to_ids(token)
+            pipe.text_encoder.get_input_embeddings().weight.data[token_id] = embedding
+            
+            print(f"  Loaded: {token} (id={token_id})")
+        
+        print(f"Successfully loaded {len(embedding_files)} embeddings")
 
-    def _estimate_hidden_size(self, name: str, block_out_channels: List[int]) -> int:
-        # Heuristic: map attention processor name to block index
-        # Names typically include down_blocks.k.attentions.l ... or mid_block/up_blocks
-        if name.startswith("mid_block"):
-            return block_out_channels[len(block_out_channels) // 2]
-        if name.startswith("up_blocks"):
-            return block_out_channels[-1]
-        # default to first block
-        return block_out_channels[0]
+    def _estimate_hidden_size(self, name: str, unet) -> int:
+        """Get the actual hidden size for an attention processor by inspecting UNet structure."""
+        # Parse the name to find the actual attention module
+        # Example names: "down_blocks.0.attentions.0.transformer_blocks.0.attn1.processor"
+        parts = name.split(".")
+        
+        # Navigate through the UNet to find the actual attention module
+        try:
+            module = unet
+            for part in parts[:-1]:  # Exclude "processor" at the end
+                if part.isdigit():
+                    module = module[int(part)]
+                else:
+                    module = getattr(module, part)
+            
+            # Get the hidden size from the attention module
+            if hasattr(module, 'to_q'):
+                return module.to_q.in_features
+            elif hasattr(module, 'query'):
+                return module.query.in_features
+        except (AttributeError, IndexError, KeyError):
+            pass
+        
+        # Fallback: use a reasonable default
+        return 320
 
     def _inject_lora(self, pipe: StableDiffusionPipeline):
         attn_procs = {}
@@ -115,9 +203,19 @@ class LoRATrainer:
 
             lora_cls = _LoRAWrapper
 
+        # Get the actual cross_attention_dim from UNet config (it should match text encoder output)
+        unet_cross_dim = pipe.unet.config.cross_attention_dim
+        print(f"UNet cross_attention_dim from config: {unet_cross_dim}")
+        print(f"Text encoder hidden_size: {pipe.text_encoder.config.hidden_size}")
+
         for name in pipe.unet.attn_processors.keys():
-            cross_attention_dim = pipe.unet.config.cross_attention_dim if name.endswith("attn2.processor") else None
-            hidden_size = self._estimate_hidden_size(name, pipe.unet.config.block_out_channels)
+            # For cross-attention (attn2), use UNet's configured cross_attention_dim
+            # For self-attention (attn1), cross_attention_dim is None
+            if name.endswith("attn2.processor"):
+                cross_attention_dim = unet_cross_dim if isinstance(unet_cross_dim, int) else unet_cross_dim
+            else:
+                cross_attention_dim = None
+            hidden_size = self._estimate_hidden_size(name, pipe.unet)
             kwargs = {}
             if rank_key:
                 kwargs[rank_key] = self.cfg.rank
@@ -160,7 +258,10 @@ class LoRATrainer:
 
     def train(self, splits: DatasetSplits, token_map: Dict[str, str], output_dir: Path) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
-        pipe = self.prepare_pipeline()
+        
+        # Look for textual inversion embeddings in outputs/textual_inversion
+        embeddings_dir = output_dir.parent / "textual_inversion"
+        pipe = self.prepare_pipeline(token_embeddings_dir=embeddings_dir)
         lora_layers = self._inject_lora(pipe)
 
         trainable_params = [p for p in lora_layers.parameters() if p.requires_grad]
@@ -198,6 +299,14 @@ class LoRATrainer:
         optimizer.zero_grad()
         global_step = 0
         running_loss = 0.0
+        
+        # Initialize metrics tracking
+        metrics_history = {
+            "steps": [],
+            "loss": [],
+            "learning_rate": []
+        }
+        
         while global_step < self.cfg.steps:
             for batch in dataloader:
                 pixel_values = batch["pixel_values"].to(device=device, dtype=pipe.unet.dtype)
@@ -221,18 +330,29 @@ class LoRATrainer:
 
                 model_pred = pipe.unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
                 loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                loss = loss / grad_accum
-                loss.backward()
-                running_loss += loss.item()
+                
+                # Scale loss for gradient accumulation
+                scaled_loss = loss / grad_accum
+                scaled_loss.backward()
+                running_loss += loss.item()  # Accumulate unscaled loss
 
                 if (global_step + 1) % grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(lora_layers.parameters(), self.cfg.max_grad_norm)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
+                    
+                    # Record metrics after optimizer step
+                    avg_loss = running_loss / grad_accum
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    metrics_history["steps"].append(global_step)
+                    metrics_history["loss"].append(avg_loss)
+                    metrics_history["learning_rate"].append(current_lr)
+                    
+                    progress_bar.set_postfix({"loss": f"{avg_loss:.4f}", "lr": f"{current_lr:.2e}"})
+                    running_loss = 0.0  # Reset after recording
 
                 progress_bar.update(1)
-                progress_bar.set_postfix({"loss": f"{running_loss:.4f}"})
                 global_step += 1
                 if global_step >= self.cfg.steps:
                     break
@@ -247,6 +367,41 @@ class LoRATrainer:
                 + ". Ensure _inject_lora wires every processor before saving."
             )
         self._export_attn_procs(pipe.unet, output_path)
+        
+        # Save training metrics
+        metrics_path = output_dir / "lora_training_metrics.json"
+        with open(metrics_path, "w") as f:
+            json.dump(metrics_history, f, indent=2)
+        print(f"Training metrics saved to: {metrics_path}")
+
+        target_modules = sorted(pipe.unet.attn_processors.keys())
+        lora_metadata = {
+            "model_id": self.cfg.model_id,
+            "rank": self.cfg.rank,
+            "alpha": self.cfg.alpha,
+            "dropout_rate": self.cfg.dropout_rate,
+            "target_modules": target_modules,
+            "resolution": self.cfg.resolution,
+            "seed": self.cfg.seed,
+            "prompt_template": self.cfg.prompt_template,
+            "mixed_precision": self.cfg.mixed_precision,
+            "training_hyperparameters": {
+                "learning_rate": self.cfg.learning_rate,
+                "steps": self.cfg.steps,
+                "batch_size": self.cfg.batch_size,
+                "gradient_accumulation_steps": self.cfg.gradient_accumulation_steps,
+                "optimizer": "AdamW",
+                "lr_scheduler": self.cfg.lr_scheduler,
+                "lr_warmup_steps": self.cfg.lr_warmup_steps,
+                "max_grad_norm": self.cfg.max_grad_norm,
+            },
+        }
+
+        config_path = output_dir / "lora_config.json"
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(lora_metadata, f, indent=2, ensure_ascii=False)
+        print(f"LoRA config saved to: {config_path}")
+        
         pipe.to("cpu")
         progress_bar.close()
         return output_path

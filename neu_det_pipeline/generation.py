@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 from typing import Dict, List, Sequence, Optional
 
 import torch
-from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
+from diffusers import (
+    ControlNetModel,
+    StableDiffusionControlNetPipeline,
+    StableDiffusionControlNetImg2ImgPipeline,
+)
 from diffusers.schedulers import (
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
+    PNDMScheduler,
 )
 from PIL import Image
+from rich.console import Console
 from rich.progress import track
 from safetensors.torch import load_file
 
@@ -24,10 +31,32 @@ SCHEDULER_REGISTRY = {
     "EulerDiscreteScheduler": EulerDiscreteScheduler,
     "EulerAncestralDiscreteScheduler": EulerAncestralDiscreteScheduler,
     "DDIMScheduler": DDIMScheduler,
+    "PNDMScheduler": PNDMScheduler,
 }
+
+logger = logging.getLogger(__name__)
 
 
 class ControlNetGenerator:
+    """
+    Component 4 of the workflow (ControlNet):
+    
+    ControlNet-based controllable image generation that utilizes:
+    1. Original input features (canny edge from original image)
+    2. Contour features (HED holistically-nested edge detection)
+    3. Depth map features (MiDaS depth estimation)
+    
+    The ControlNet assists the generative network in achieving controllable 
+    generation. As a result, the generated defect positions in the images 
+    align closely with the original images, allowing for the reuse of 
+    existing annotations and alleviating the substantial annotation effort 
+    involved in generating images.
+    
+    Works in conjunction with:
+    - CLIP textual inversion (Component 1): provides prompt keywords
+    - LoRA fine-tuned SD 1.5 (Component 2): provides style and texture
+    - HED/MiDaS features (Component 3): provides controllable guidance
+    """
     def __init__(self, cfg: GenerationConfig):
         self.cfg = cfg
 
@@ -55,9 +84,17 @@ class ControlNetGenerator:
                 raise OSError(f"无法加载 ControlNet '{repo_id}': {exc}. {hint}") from exc
         return models
 
-    def _build_base_pipe(self, control_nets: Sequence[ControlNetModel]) -> StableDiffusionControlNetPipeline:
+    def _build_base_pipe(
+        self,
+        control_nets: Sequence[ControlNetModel],
+        *,
+        use_img2img: bool = False,
+    ) -> StableDiffusionControlNetPipeline:
         try:
-            pipe = StableDiffusionControlNetPipeline.from_pretrained(
+            pipe_cls = (
+                StableDiffusionControlNetImg2ImgPipeline if use_img2img else StableDiffusionControlNetPipeline
+            )
+            pipe = pipe_cls.from_pretrained(
                 self.cfg.base_model,
                 controlnet=list(control_nets),
                 torch_dtype=torch.float16,
@@ -195,12 +232,54 @@ class ControlNetGenerator:
                 f"无法加载 LoRA 权重 {lora_path}: {exc}\n最近一次 diffusers 加载错误: {last_error}"
             ) from exc
 
-    def build_pipeline(self, lora_path: Path) -> StableDiffusionControlNetPipeline:
+    def build_pipeline(
+        self,
+        lora_path: Path,
+        *,
+        use_img2img: bool = False,
+    ) -> StableDiffusionControlNetPipeline:
+        # Clear CUDA cache before building pipeline
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        logger.info("Building pipeline (img2img=%s) with base model %s", use_img2img, self.cfg.base_model)
         control_nets = self._load_controlnets()
-        pipe = self._build_base_pipe(control_nets)
+        logger.info("Loaded %d ControlNet(s)", len(control_nets))
+        pipe = self._build_base_pipe(control_nets, use_img2img=use_img2img)
         self._configure_scheduler(pipe)
         self._load_lora(pipe, lora_path)
-        pipe.enable_model_cpu_offload()
+        logger.info("LoRA weights loaded from %s", lora_path)
+        
+        # Enable xformers memory efficient attention if available
+        if torch.cuda.is_available():
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                logger.info("Enabled xformers memory efficient attention")
+            except Exception as e:
+                logger.warning("Could not enable xformers: %s. Falling back to default attention.", e)
+        
+        # Enable sequential CPU offload for lower VRAM usage when supported
+        offload_enabled = False
+        if torch.cuda.is_available():
+            try:
+                pipe.enable_sequential_cpu_offload()
+                offload_enabled = True
+                logger.info("Model CPU offload enabled")
+            except NotImplementedError as exc:
+                # Older accelerate/torch combos cannot move meta tensors via .to()
+                logger.warning(
+                    "Sequential CPU offload unavailable (%s). Keeping pipeline on CUDA memory instead.",
+                    exc,
+                )
+                pipe.to("cuda")
+        if not offload_enabled and not torch.cuda.is_available():
+            pipe.to("cpu")
+        
+        # Set to eval mode for inference
+        pipe.unet.eval()
+        for cn in pipe.controlnet if isinstance(pipe.controlnet, list) else [pipe.controlnet]:
+            cn.eval()
+        
         return pipe
 
     # ------------------------------------------------------------------
@@ -218,15 +297,41 @@ class ControlNetGenerator:
         stem: str,
         conditioning: Dict[str, Dict[str, Path]],
     ) -> List[Image.Image]:
+        """
+        Load three types of conditioning images for multi-ControlNet:
+        1. Canny edge (original input structure)
+        2. HED contour (approximate contours)
+        3. MiDaS depth (depth map)
+        
+        All images are resized to 512x512 to ensure compatibility.
+        """
         if stem not in conditioning:
             raise KeyError(f"缺少样本 {stem} 的引导文件。")
         images: List[Image.Image] = []
         entry = conditioning[stem]
+        target_size = (512, 512)  # Standard SD resolution
+        
         for modality in self.cfg.controlnet_modalities:
             if modality not in entry:
                 raise KeyError(f"样本 {stem} 缺少模态 {modality} 的引导图。")
-            images.append(Image.open(entry[modality]).convert("RGB"))
+            img = Image.open(entry[modality]).convert("RGB")
+            # Resize to ensure all conditioning images have the same dimensions
+            if img.size != target_size:
+                img = img.resize(target_size, Image.Resampling.LANCZOS)
+            images.append(img)
         return images
+
+    def _load_init_image(self, stem: str, init_images: Dict[str, Path]) -> Image.Image:
+        if stem not in init_images:
+            raise KeyError(f"缺少样本 {stem} 的原始图像，无法执行细节保持 img2img。")
+        image_path = Path(init_images[stem])
+        if not image_path.exists():
+            raise FileNotFoundError(f"找不到用于 img2img 的原始图像: {image_path}")
+        img = Image.open(image_path).convert("RGB")
+        target_size = (512, 512)
+        if img.size != target_size:
+            img = img.resize(target_size, Image.Resampling.LANCZOS)
+        return img
 
     # ------------------------------------------------------------------
     # Public API
@@ -237,27 +342,81 @@ class ControlNetGenerator:
         prompt_items: List[tuple[str, str]],
         conditioning: Dict[str, Dict[str, Path]],
         output_dir: Path,
+        init_images: Optional[Dict[str, Path]] = None,
     ) -> List[Path]:
         self._ensure_lengths()
-        pipe = self.build_pipeline(lora_path)
+        use_img2img = bool(init_images)
+        pipe = self.build_pipeline(lora_path, use_img2img=use_img2img)
         output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Starting generation for %d prompt(s); img2img=%s; output_dir=%s",
+            len(prompt_items),
+            use_img2img,
+            output_dir,
+        )
 
         results: List[Path] = []
-        for stem, prompt in track(prompt_items, description="Generating"):
-            ctrl_images = self._load_condition_images(stem, conditioning)
-            # If only one ControlNet is in use, we must pass a single image instead of a list
-            cond_image = ctrl_images[0] if len(ctrl_images) == 1 else ctrl_images
-            image = pipe(
-                prompt,
-                num_inference_steps=self.cfg.num_inference_steps,
-                guidance_scale=self.cfg.guidance_scale,
-                image=cond_image,
-                controlnet_conditioning_scale=self.cfg.control_scales,
-            ).images[0]
-            out_path = output_dir / f"{stem}.png"
-            image.save(out_path)
-            results.append(out_path)
+        for idx, (stem, prompt) in enumerate(track(prompt_items, description="Generating")):
+            logger.info("[%d/%d] Generating '%s'", idx + 1, len(prompt_items), stem)
+            try:
+                # Clear CUDA cache before each generation to avoid memory issues
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                ctrl_images = self._load_condition_images(stem, conditioning)
+                # If only one ControlNet is in use, we must pass a single image instead of a list
+                cond_image = ctrl_images[0] if len(ctrl_images) == 1 else ctrl_images
+                
+                # Generate with error handling and type safety
+                with torch.inference_mode():
+                    if use_img2img:
+                        if init_images is None:
+                            raise RuntimeError("init_images 缺失，无法执行 img2img 以保留纹理细节。")
+                        init_image = self._load_init_image(stem, init_images)
+                        output = pipe(
+                            prompt,
+                            image=init_image,
+                            control_image=cond_image,
+                            num_inference_steps=self.cfg.num_inference_steps,
+                            guidance_scale=self.cfg.guidance_scale,
+                            strength=self.cfg.denoising_strength,
+                            controlnet_conditioning_scale=self.cfg.control_scales,
+                        )
+                    else:
+                        output = pipe(
+                            prompt,
+                            num_inference_steps=self.cfg.num_inference_steps,
+                            guidance_scale=self.cfg.guidance_scale,
+                            image=cond_image,
+                            controlnet_conditioning_scale=self.cfg.control_scales,
+                        )
+                    image = output.images[0]
+                
+                out_path = output_dir / f"{stem}.png"
+                image.save(out_path)
+                results.append(out_path)
+                logger.info("Saved %s", out_path)
+                
+            except RuntimeError as e:
+                console_err = Console(stderr=True)
+                console_err.print(f"[red]生成 {stem} 时出错: {e}[/red]")
+                console_err.print(f"[yellow]跳过该样本并继续...[/yellow]")
+                logger.exception("Runtime error while generating %s", stem)
+                continue
+            except Exception as e:
+                console_err = Console(stderr=True)
+                console_err.print(f"[red]处理 {stem} 时发生未预期错误: {e}[/red]")
+                logger.exception("Unexpected error while generating %s", stem)
+                raise
 
-        pipe.to("cpu")
-        torch.cuda.empty_cache()
+        # Final cleanup: move back to CPU when supported
+        try:
+            pipe.to("cpu")
+        except NotImplementedError as exc:
+            logger.warning("Skipping final CPU transfer due to meta tensor limitation: %s", exc)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        logger.info("Generation complete. Produced %d image(s)", len(results))
         return results
