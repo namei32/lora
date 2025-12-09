@@ -1,174 +1,81 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 from PIL import Image
 from rich.progress import track
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import CLIPModel, CLIPProcessor
 
 from .data import DefectSample
 
 
 class CaptionGenerator:
-    """
-    Automatic prompt generation using BLIP (Bootstrapping Language-Image Pre-training).
-    
-    Instead of using fixed templates, BLIP analyzes each defect image and generates
-    descriptive captions that can be used as prompts for generation.
-    """
-    
+    """Generate ControlNet prompts by ranking templates with CLIP vision-language similarity."""
+
+    BASE_TEMPLATES: Sequence[str] = (
+        "macro shot of {token} steel surface showing {descriptor}",
+        "industrial close-up of {token} exhibiting {descriptor}",
+        "{descriptor} on hot-rolled steel texture ({token})",
+        "detail photo of {token} steel plate with {descriptor}",
+    )
+
+    DEFECT_DESCRIPTORS: Dict[str, List[str]] = {
+        "crazing": ["fine crack networks", "crazing fracture lines", "micro-scale crack mesh"],
+        "inclusion": ["embedded inclusions", "foreign particles trapped in steel", "dark inclusion clusters"],
+        "patches": ["irregular oxidized patches", "stain-like surface patches", "diffuse defect patches"],
+        "pitted_surface": ["pitting corrosion pits", "scattered cavities", "etched pit patterns"],
+        "rolled-in_scale": ["rolled-in oxide scale", "compressed scale streaks", "oxide residue bands"],
+        "scratches": ["linear scratch grooves", "abrasion streaks", "parallel scratch marks"],
+    }
+
     def __init__(
-        self, 
-        model_name: str = "Salesforce/blip-image-captioning-large",
-        device: Optional[str] = None
-    ):
-        """
-        Initialize BLIP caption generator.
-        
-        Args:
-            model_name: HuggingFace model ID for BLIP
-            device: Device to run model on (auto-detect if None)
-        """
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Always use float32 to avoid CUDA precision errors
-        self.processor = BlipProcessor.from_pretrained(model_name)
-        self.model = BlipForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=torch.float32  # Use float32 to avoid CUBLAS errors
-        ).to(self.device)
+        self,
+        model_name: str = "openai/clip-vit-large-patch14",
+        device: Optional[str] = None,
+    ) -> None:
+        self.device = device or self._require_discrete_cuda()
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+        self.model = CLIPModel.from_pretrained(model_name).to(self.device)
         self.model.eval()
-        
-        # Clear CUDA cache to free memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
-    def generate_caption(
-        self, 
-        image_path: Path, 
-        max_length: int = 30,
-        prefix: str = "a photo of"
-    ) -> str:
-        """
-        Generate caption for a single image.
-        
-        Args:
-            image_path: Path to input image
-            max_length: Maximum length of generated caption
-            prefix: Optional prefix to guide caption generation
-            
-        Returns:
-            Generated caption string
-        """
-        image = Image.open(image_path).convert("RGB")
-        
-        # Process image and generate caption
-        inputs = self.processor(image, prefix, return_tensors="pt").to(self.device)
-        
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                num_beams=4,
-                early_stopping=True
+
+    @staticmethod
+    def _require_discrete_cuda() -> torch.device:
+        """Ensure CLIP scoring runs on a CUDA-capable discrete GPU."""
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "未检测到可用的 NVIDIA CUDA 设备。提示生成已强制使用独立显卡，不再回落 CPU/核显。"
             )
-        
-        caption = self.processor.decode(output_ids[0], skip_special_tokens=True)
-        return caption
+        idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        print(f"Using CUDA device {idx}: {props.name} ({props.total_memory / (1024 ** 3):.1f} GB)")
+        return torch.device(f"cuda:{idx}")
     
-    def batch_generate(
-        self,
-        samples: List[DefectSample],
-        output_file: Optional[Path] = None,
-        prefix: str = "industrial steel surface with"
-    ) -> Dict[str, str]:
-        """
-        Generate captions for all samples in the dataset.
-        
-        Args:
-            samples: List of defect samples
-            output_file: Optional path to save caption mapping as JSON
-            prefix: Prefix to guide caption generation towards industrial defect description
-            
-        Returns:
-            Dictionary mapping image stem to generated caption
-        """
-        captions: Dict[str, str] = {}
-        
-        for sample in track(samples, description="Generating captions"):
-            stem = sample.image_path.stem
-            caption = self.generate_caption(sample.image_path, prefix=prefix)
-            
-            # Post-process to ensure industrial context and remove generic descriptions
-            caption = self._post_process_industrial(caption, sample.cls_name)
-            captions[stem] = caption
-        
-        # Save to file if requested
-        if output_file:
-            import json
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(captions, f, indent=2, ensure_ascii=False)
-        
-        return captions
-    
-    def _post_process_industrial(self, caption: str, defect_class: str) -> str:
-        """
-        Post-process caption to ensure industrial steel surface context.
-        Removes generic/irrelevant terms and adds industry-specific vocabulary.
-        
-        Args:
-            caption: Raw BLIP-generated caption
-            defect_class: Defect class name (e.g., 'crazing', 'inclusion')
-            
-        Returns:
-            Enhanced caption suitable for industrial steel defect description
-        """
-        # Remove common non-industrial terms
-        remove_terms = [
-            "person", "people", "man", "woman", "child", "face",
-            "outdoor", "indoor", "building", "sky", "tree", "grass",
-            "animal", "dog", "cat", "bird", "car", "vehicle",
-            "food", "plate", "table", "chair", "room",
-            "colorful", "beautiful", "scenic", "landscape"
-        ]
-        
-        caption_lower = caption.lower()
-        for term in remove_terms:
-            if term in caption_lower:
-                # Replace with generic industrial term
-                caption = caption.replace(term, "surface")
-        
-        # Ensure industrial terminology
-        industrial_keywords = {
-            "crazing": "fine cracks and fracture patterns",
-            "inclusion": "embedded particles and impurities",
-            "patches": "irregular surface patches and discoloration",
-            "pitted_surface": "pitting corrosion and surface cavities",
-            "rolled-in_scale": "oxide scale pressed into surface",
-            "scratches": "linear scratches and abrasion marks"
-        }
-        
-        # Add defect-specific description if available
-        if defect_class in industrial_keywords:
-            defect_desc = industrial_keywords[defect_class]
-            # Only add if not already mentioned
-            if not any(word in caption_lower for word in defect_desc.split()[:2]):
-                caption = f"{defect_desc}, {caption}"
-        
-        # Ensure "steel" or "metal" is mentioned
-        if "steel" not in caption_lower and "metal" not in caption_lower:
-            caption = f"metallic steel texture, {caption}"
-        
-        # Clean up
-        caption = caption.strip().strip(",").strip()
-        
-        return caption
-    
+    def _build_candidates(self, cls_name: str, token: str) -> List[str]:
+        descriptors = self.DEFECT_DESCRIPTORS.get(
+            cls_name, ["steel surface defect texture", cls_name.replace("_", " ")]
+        )
+        prompts: List[str] = []
+        for template in self.BASE_TEMPLATES:
+            for descriptor in descriptors:
+                prompts.append(template.format(token=token, descriptor=descriptor, cls=cls_name.replace("_", " ")))
+        # Ensure at least one fallback template
+        prompts.append(f"macro photo of {token} steel surface highlighting {cls_name.replace('_', ' ')}")
+        return list(dict.fromkeys(prompt.strip() for prompt in prompts))  # deduplicate while preserving order
+
+    def _select_prompt(self, image: Image.Image, candidates: List[str]) -> str:
+        inputs = self.processor(text=candidates, images=image, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            logits = outputs.logits_per_image[0]
+        best_idx = int(torch.argmax(logits))
+        return candidates[best_idx]
+
     def generate_with_token(
         self,
         samples: List[DefectSample],
@@ -188,57 +95,16 @@ class CaptionGenerator:
             Dictionary mapping image stem to keyword-based prompts with LoRA weight
         """
         captions: Dict[str, str] = {}
-        
-        # Core industrial steel defect keywords (extracted from CLIP training)
-        # These represent the top 40% most frequent descriptive terms
-        core_keywords = [
-            "grayscale",
-            "greyscale", 
-            "hot-rolled steel strip",
-            "monochrome",
-            "no humans",
-            "surface defects",
-            "texture",
-            "metallic surface",
-            "industrial material"
-        ]
-        
-        # Defect-specific keywords (also from CLIP frequency analysis)
-        defect_specific = {
-            "crazing": ["fine cracks", "network patterns", "crazing"],
-            "inclusion": ["embedded particles", "inclusion", "foreign material"],
-            "patches": ["surface patches", "irregular areas", "patches"],
-            "pitted_surface": ["pitting", "surface cavities", "pitted surface"],
-            "rolled-in_scale": ["rolled-in scale", "oxide scale", "scale defects"],
-            "scratches": ["scratches", "linear marks", "abrasion"]
-        }
-        
-        for sample in track(samples, description="Generating CLIP-based prompts"):
+        for sample in track(samples, description="Selecting CLIP prompts"):
             stem = sample.image_path.stem
             cls_name = sample.cls_name
-            
-            # Build keyword list from CLIP-derived terms
-            keywords = core_keywords.copy()
-            
-            # Add class-specific keywords
-            if cls_name in defect_specific:
-                keywords.extend(defect_specific[cls_name])
-            
-            # Get learned token
-            token = token_map.get(cls_name, cls_name)
-            
-            # Add explicit class name for clarity
-            keywords.append(cls_name.replace("_", " "))
-            
-            # Format: "keywords, token, lora:model:weight"
-            # Following the paper's format
-            prompt = ", ".join(keywords)
-            prompt += f", {token}"
-            
+            token = token_map.get(cls_name, cls_name.replace("_", " "))
+            candidates = self._build_candidates(cls_name, token)
+            image = Image.open(sample.image_path).convert("RGB")
+            prompt = self._select_prompt(image, candidates)
             captions[stem] = prompt
         
         if output_file:
-            import json
             output_file.parent.mkdir(parents=True, exist_ok=True)
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(captions, f, indent=2, ensure_ascii=False)

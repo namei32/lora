@@ -84,6 +84,18 @@ class TextualInversionTrainer:
         self.token_prefix = token_prefix
         self.initializer_token = initializer_token
 
+    @staticmethod
+    def _require_discrete_cuda() -> torch.device:
+        """Ensure a CUDA-capable discrete GPU is present."""
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "未检测到可用的 NVIDIA CUDA 设备。文本反演训练已强制使用独立显卡，不再回落 CPU/核显。"
+            )
+        idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        print(f"Using CUDA device {idx}: {props.name} ({props.total_memory / (1024 ** 3):.1f} GB)")
+        return torch.device(f"cuda:{idx}")
+
     def train_embeddings(
         self,
         splits: DatasetSplits,
@@ -112,7 +124,7 @@ class TextualInversionTrainer:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._require_discrete_cuda()
         print(f"Using device: {device}")
         
         # Load models - force float32 to avoid dtype issues

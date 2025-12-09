@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import subprocess
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Optional, Dict, Any, List
 
 import typer
 import torch
+import shutil
 from rich.console import Console
 
 from .config import (
@@ -208,13 +210,14 @@ def caption(
     ctx: typer.Context,
     dataset_root: Path = typer.Argument(..., exists=True, file_okay=False),
     output_file: Path = typer.Option(Path("outputs/captions.json"), file_okay=True),
-    model_name: str = typer.Option("Salesforce/blip-image-captioning-large"),
+    model_name: str = typer.Option("openai/clip-vit-large-patch14"),
 ) -> None:
-    """Generate automatic captions for all images using BLIP."""
+    """Generate automatic prompts for all images using CLIP ranking."""
     bundle = _ensure_bundle(ctx)
     samples = collect_dataset(dataset_root)
+    token_map = {cls: f"<neu_{cls}>" for cls in set(s.cls_name for s in samples)}
     generator = CaptionGenerator(model_name=model_name)
-    captions = generator.batch_generate(samples, output_file=output_file)
+    captions = generator.generate_with_token(samples, token_map, output_file=output_file)
     generator.cleanup()
     console.print(f"Generated {len(captions)} captions, saved to {output_file}")
 
@@ -246,9 +249,8 @@ def generate(
     caption_file: Optional[Path] = typer.Option(None, help="Path to auto-generated captions JSON file (will auto-generate if not provided)"),
     priority_class: Optional[str] = typer.Option(None, help="Prioritize generating this defect class first (e.g., 'inclusion')"),
     max_samples: Optional[int] = typer.Option(None, help="Limit the number of samples to generate (for quick smoke tests)"),
-    model_name: str = typer.Option("Salesforce/blip-image-captioning-large", help="BLIP model for caption generation"),
+    model_name: str = typer.Option("openai/clip-vit-large-patch14", help="CLIP model for prompt selection"),
     log_file: Optional[Path] = typer.Option(None, help="日志文件路径 (默认: 每次生成独立 run_xxx/run.log)"),
-    metrics_file: Optional[Path] = typer.Option(None, help="保存生成质量指标的 JSON 路径 (默认: run_xxx/metrics.json)"),
 ) -> None:
     """Generate images with LoRA and ControlNet using auto-generated captions."""
     bundle = _ensure_bundle(ctx)
@@ -257,8 +259,11 @@ def generate(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = output_dir / f"run_{timestamp}"
     image_dir = run_dir / "images"
+    artifacts_dir = run_dir / "artifacts"
     run_dir.mkdir(parents=True, exist_ok=True)
     image_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    artifact_paths: Dict[str, str] = {}
 
     effective_log = log_file or (run_dir / "run.log")
     _setup_logging(effective_log)
@@ -308,6 +313,29 @@ def generate(
     else:
         console.print(f"Loading captions from {caption_file}")
         captions = load_captions_from_file(caption_file)
+
+    # Snapshot artifacts (captions, config, LoRA metadata) for reproducibility
+    if caption_file.exists():
+        caption_dest = artifacts_dir / caption_file.name
+        try:
+            if caption_dest.resolve() != caption_file.resolve():
+                shutil.copy2(caption_file, caption_dest)
+        except FileNotFoundError:
+            caption_dest = caption_file
+        artifact_paths["captions"] = str(caption_dest.resolve())
+
+    if bundle.source_path and bundle.source_path.exists():
+        config_dest = artifacts_dir / bundle.source_path.name
+        if config_dest.resolve() != bundle.source_path.resolve():
+            shutil.copy2(bundle.source_path, config_dest)
+        artifact_paths["config"] = str(config_dest.resolve())
+
+    lora_config_path = lora_path.parent / "lora_config.json"
+    if lora_config_path.exists():
+        lora_config_dest = artifacts_dir / lora_config_path.name
+        if lora_config_dest.resolve() != lora_config_path.resolve():
+            shutil.copy2(lora_config_path, lora_config_dest)
+        artifact_paths["lora_config"] = str(lora_config_dest.resolve())
     
     # Build prompt items using auto-generated captions
     prompt_items = [(s.image_path.stem, captions.get(s.image_path.stem, f"macro shot of {token_map[s.cls_name]} steel surface")) for s in samples]
@@ -318,7 +346,7 @@ def generate(
 
     manifest: Dict[str, object]
     if generated_paths:
-        metrics_dest = metrics_file or (run_dir / "metrics.json")
+        metrics_dest = run_dir / "metrics.json"
         evaluator = GenerationMetricsEvaluator()
         metric_result = evaluator.evaluate(generated_paths, init_images, conditioning)
         run_details = {
@@ -332,11 +360,13 @@ def generate(
             "num_inference_steps": cfg.num_inference_steps,
             "guidance_scale": cfg.guidance_scale,
             "denoising_strength": cfg.denoising_strength,
-            "device": evaluator.device,
+            # Ensure JSON-serializable device field
+            "device": str(evaluator.device),
             "output_directory": str(image_dir.resolve()),
             "max_samples": max_samples,
         }
         save_metrics(metric_result, metrics_dest, extra=run_details)
+        artifact_paths["metrics"] = str(metrics_dest.resolve())
 
         manifest = {
             **run_details,
@@ -348,6 +378,7 @@ def generate(
             "controlnet_parameters": controlnet_parameters,
             "training_hyperparameters": training_hparams,
             "other_config": other_config,
+            "artifacts": artifact_paths,
         }
     else:
         console.print("[yellow]未生成任何图像，跳过指标评估。[/yellow]")
@@ -373,10 +404,30 @@ def generate(
             "controlnet_parameters": controlnet_parameters,
             "training_hyperparameters": training_hparams,
             "other_config": other_config,
+            "artifacts": artifact_paths,
         }
 
     manifest_path = run_dir / "run_context.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+
+    # Automatically refresh YOLO dataset with latest generated images
+    try:
+        console.print("[cyan]自动运行 prepare_yolo_dataset.py 以更新 YOLO 数据集...[/cyan]")
+        prepare_script = Path(__file__).resolve().parent.parent / "prepare_yolo_dataset.py"
+        # Place the refreshed YOLO dataset inside the current run folder
+        yolo_output = run_dir / "yolo_dataset"
+        cmd = [
+            sys.executable,
+            str(prepare_script),
+            str(dataset_root),
+            str(image_dir),
+            "--output-dir",
+            str(yolo_output),
+        ]
+        subprocess.run(cmd, check=True)
+        console.print(f"[green]YOLO 数据集已更新: {yolo_output}[/green]")
+    except Exception as exc:  # noqa: BLE001 - we want to log and continue
+        console.print(f"[yellow]prepare_yolo_dataset 运行失败: {exc}。请手动检查。[/yellow]")
 
 
 if __name__ == "__main__":

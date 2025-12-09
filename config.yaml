@@ -46,18 +46,16 @@ defaults:
     prompt_template: "a photo of {token}"
     hf_token: null
     controlnet_models:
-      - "lllyasviel/control_v11p_sd15_canny"
       - "lllyasviel/control_v11p_sd15_softedge"
       - "lllyasviel/control_v11f1p_sd15_depth"
     controlnet_modalities:
-      - "canny"
       - "hed"
       - "depth"
     num_inference_steps: 50
     guidance_scale: 7.5
-    control_scales: [1.0, 1.0, 1.0]
-    control_start_steps: [0.0, 0.0, 0.0]
-    control_end_steps: [1.0, 1.0, 1.0]
+    control_scales: [1.0, 1.0]
+    control_start_steps: [0.0, 0.0]
+    control_end_steps: [1.0, 1.0]
     denoising_strength: 0.2
     scheduler: "PNDMScheduler"
     seed: 42

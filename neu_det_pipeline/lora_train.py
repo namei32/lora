@@ -75,6 +75,17 @@ class LoRATrainer:
     def __init__(self, cfg: LoRAConfig):
         self.cfg = cfg
 
+    def _require_discrete_cuda(self) -> torch.device:
+        """Ensure a CUDA-capable discrete GPU is available."""
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "未检测到可用的 NVIDIA CUDA 设备。训练已强制使用独立显卡，不再回落 CPU/核显。"
+            )
+        idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        print(f"Using CUDA device {idx}: {props.name} ({props.total_memory / (1024 ** 3):.1f} GB)")
+        return torch.device(f"cuda:{idx}")
+
     def prepare_pipeline(self, token_embeddings_dir: Path = None) -> StableDiffusionPipeline:
         """
         Prepare SD pipeline and load textual inversion embeddings if available.
@@ -82,13 +93,14 @@ class LoRATrainer:
         Args:
             token_embeddings_dir: Directory containing textual inversion embeddings (*.pt files)
         """
+        device = self._require_discrete_cuda()
         pipe = StableDiffusionPipeline.from_pretrained(
             self.cfg.model_id,
             torch_dtype=torch.float32,
             safety_checker=None,
             requires_safety_checker=False
         )
-        pipe.to("cuda" if torch.cuda.is_available() else "cpu")
+        pipe.to(device)
         pipe.set_progress_bar_config(disable=True)
         
         # Load textual inversion embeddings if directory is provided
@@ -473,9 +485,25 @@ if _needs_lora_fallback(LoRAAttnProcessor) or _needs_lora_fallback(LoRAAttnProce
             torch.nn.init.zeros_(self.up.weight)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            dtype = x.dtype
-            projected = self.up(self.down(x.to(self.down.weight.dtype))) * self.scale
-            return projected.to(dtype)
+            # Keep compute in the same dtype as incoming activations to avoid implicit upcasts
+            # that can trigger large GEMMs and cublas errors on constrained GPUs.
+            target_dtype = x.dtype
+            if self.down.weight.dtype != target_dtype:
+                self.down.to(dtype=target_dtype)
+                self.up.to(dtype=target_dtype)
+            try:
+                projected = self.up(self.down(x)) * self.scale
+                return projected
+            except RuntimeError as exc:
+                # Fallback to float32 compute if cublas encounters internal errors on fp16
+                message = str(exc)
+                if "CUBLAS_STATUS" not in message and "cublas" not in message:
+                    raise
+                float_x = x.float()
+                self.down.to(dtype=torch.float32)
+                self.up.to(dtype=torch.float32)
+                projected = self.up(self.down(float_x)) * self.scale
+                return projected.to(target_dtype)
 
     class _BaseFallbackLoRA(torch.nn.Module):
         def __init__(self, hidden_size: int, cross_attention_dim: Optional[int] = None, rank: int = 4, alpha: Optional[int] = None):

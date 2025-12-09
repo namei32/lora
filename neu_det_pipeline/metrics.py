@@ -19,8 +19,14 @@ from torchvision import transforms
 console = Console()
 
 
-def _default_device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
+def _require_discrete_cuda() -> torch.device:
+    """Ensure metrics run on a CUDA-capable discrete GPU."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("未检测到可用的 NVIDIA CUDA 设备。指标计算已强制使用独立显卡，不再回落 CPU/核显。")
+    idx = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(idx)
+    console.print(f"[green]Using CUDA device {idx}: {props.name} ({props.total_memory / (1024 ** 3):.1f} GB)[/green]")
+    return torch.device(f"cuda:{idx}")
 
 
 def _stem(path: Path) -> str:
@@ -82,7 +88,7 @@ class GenerationMetricsEvaluator:
         device: Optional[str] = None,
         image_size: int = 299,
     ) -> None:
-        self.device = device or _default_device()
+        self.device = device or _require_discrete_cuda()
         self.image_size = image_size
         self.transform = transforms.Compose(
             [

@@ -60,6 +60,37 @@ class ControlNetGenerator:
     def __init__(self, cfg: GenerationConfig):
         self.cfg = cfg
 
+    @staticmethod
+    def _safe_empty_cache() -> None:
+        """Clear CUDA cache and surface CUDA context failures early."""
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except Exception as exc:  # noqa: BLE001
+            # If CUDA context is corrupted (e.g., illegal memory access), fail fast
+            logger.error("CUDA empty_cache failed; aborting run to avoid repeated illegal access: %s", exc)
+            raise
+
+    def _require_discrete_cuda(self) -> torch.device:
+        """Ensure a CUDA-capable discrete GPU is present and return its device."""
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "检测到未启用 CUDA。当前流程已强制使用 NVIDIA 独立显卡，不再回落 CPU/核显。请安装正确的驱动与 CUDA 工具链。"
+            )
+
+        # Respect CUDA_VISIBLE_DEVICES if set; default to the current device
+        device_idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device_idx)
+        logger.info(
+            "Using CUDA device %d: %s (%.1f GB)",
+            device_idx,
+            props.name,
+            props.total_memory / (1024 ** 3),
+        )
+        return torch.device(f"cuda:{device_idx}")
+
     # ------------------------------------------------------------------
     # Loading helpers
     # ------------------------------------------------------------------
@@ -238,9 +269,9 @@ class ControlNetGenerator:
         *,
         use_img2img: bool = False,
     ) -> StableDiffusionControlNetPipeline:
-        # Clear CUDA cache before building pipeline
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Enforce discrete GPU usage (no CPU/iGPU fallback)
+        device = self._require_discrete_cuda()
+        torch.cuda.empty_cache()
         
         logger.info("Building pipeline (img2img=%s) with base model %s", use_img2img, self.cfg.base_model)
         control_nets = self._load_controlnets()
@@ -250,30 +281,16 @@ class ControlNetGenerator:
         self._load_lora(pipe, lora_path)
         logger.info("LoRA weights loaded from %s", lora_path)
         
-        # Enable xformers memory efficient attention if available
-        if torch.cuda.is_available():
-            try:
-                pipe.enable_xformers_memory_efficient_attention()
-                logger.info("Enabled xformers memory efficient attention")
-            except Exception as e:
-                logger.warning("Could not enable xformers: %s. Falling back to default attention.", e)
+        # Disable xformers to avoid CUDA kernel crashes; rely on PyTorch 2.0+ SDPA which is stable
+        try:
+            pipe.disable_xformers_memory_efficient_attention()
+            logger.info("xformers disabled for stability (using PyTorch SDPA)")
+        except Exception:
+            pass
         
-        # Enable sequential CPU offload for lower VRAM usage when supported
-        offload_enabled = False
-        if torch.cuda.is_available():
-            try:
-                pipe.enable_sequential_cpu_offload()
-                offload_enabled = True
-                logger.info("Model CPU offload enabled")
-            except NotImplementedError as exc:
-                # Older accelerate/torch combos cannot move meta tensors via .to()
-                logger.warning(
-                    "Sequential CPU offload unavailable (%s). Keeping pipeline on CUDA memory instead.",
-                    exc,
-                )
-                pipe.to("cuda")
-        if not offload_enabled and not torch.cuda.is_available():
-            pipe.to("cpu")
+        # Use model CPU offload for lower VRAM usage and stability
+        pipe.enable_model_cpu_offload()
+        logger.info("Model CPU offload enabled")
         
         # Set to eval mode for inference
         pipe.unet.eval()
@@ -359,10 +376,8 @@ class ControlNetGenerator:
         for idx, (stem, prompt) in enumerate(track(prompt_items, description="Generating")):
             logger.info("[%d/%d] Generating '%s'", idx + 1, len(prompt_items), stem)
             try:
-                # Clear CUDA cache before each generation to avoid memory issues
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                # Clear CUDA cache before each generation; fail fast on CUDA context errors
+                self._safe_empty_cache()
                 
                 ctrl_images = self._load_condition_images(stem, conditioning)
                 # If only one ControlNet is in use, we must pass a single image instead of a list
@@ -399,6 +414,15 @@ class ControlNetGenerator:
                 logger.info("Saved %s", out_path)
                 
             except RuntimeError as e:
+                # If CUDA context is corrupted, abort the run instead of spamming retries
+                if "CUDA error" in str(e) or "illegal memory access" in str(e):
+                    console_err = Console(stderr=True)
+                    console_err.print(
+                        "[red]检测到 CUDA 非法访问/上下文损坏，终止本次生成。请重启 Python 进程并考虑设置 CUDA_LAUNCH_BLOCKING=1 以定位问题。[/red]"
+                    )
+                    logger.exception("Fatal CUDA error while generating %s", stem)
+                    raise
+
                 console_err = Console(stderr=True)
                 console_err.print(f"[red]生成 {stem} 时出错: {e}[/red]")
                 console_err.print(f"[yellow]跳过该样本并继续...[/yellow]")
