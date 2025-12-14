@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -10,6 +11,46 @@ from rich.progress import track
 from transformers import CLIPModel, CLIPProcessor
 
 from .data import DefectSample
+
+
+class KeywordExtractor:
+    """Extract high-frequency keywords from textual inversion training outputs."""
+    
+    # Paper-specified keywords (top 40% frequency-based selection)
+    PAPER_KEYWORDS = [
+        "grayscale", "greyscale", "hotrolled steel strip", "monochrome", "no humans",
+        "surface defects", "texture", "rolled-in scale"
+    ]
+    
+    DEFECT_SPECIFIC_KEYWORDS = {
+        "crazing": ["fine cracks", "crack networks", "fracture lines"],
+        "inclusion": ["embedded particles", "inclusions", "dark clusters"],
+        "patches": ["oxidized patches", "stain-like", "diffuse defects"],
+        "pitted_surface": ["pitting", "corrosion pits", "cavities"],
+        "rolled-in_scale": ["oxide scale", "scale streaks", "residue bands"],
+        "scratches": ["scratch grooves", "abrasion", "scratch marks"],
+    }
+    
+    @staticmethod
+    def build_paper_style_prompt(
+        class_name: str,
+        token: str,
+        base_keywords: List[str] | None = None,
+        defect_specific: List[str] | None = None,
+        lora_weight: float = 1.0,
+    ) -> str:
+        """Build paper-style prompt: keyword1, keyword2, ..., loRA:token:weight"""
+        keywords = []
+        if base_keywords:
+            keywords.extend(base_keywords)
+        if defect_specific:
+            keywords.extend(defect_specific)
+        
+        unique_keywords = list(dict.fromkeys(keywords))
+        lora_weight_int = int(lora_weight) if lora_weight == int(lora_weight) else lora_weight
+        prompt = ", ".join(unique_keywords)
+        prompt += f", loRA:{token}:{lora_weight_int}"
+        return prompt
 
 
 class CaptionGenerator:
@@ -80,28 +121,44 @@ class CaptionGenerator:
         self,
         samples: List[DefectSample],
         token_map: Dict[str, str],
-        output_file: Optional[Path] = None
+        output_file: Optional[Path] = None,
+        use_paper_keywords: bool = True,
+        lora_weight: float = 1.0,
     ) -> Dict[str, str]:
         """
-        Generate captions using CLIP-derived keywords from textual inversion.
-        Keywords are selected from the training process based on frequency (top 40%).
+        Generate captions using paper-style keyword format with LoRA weights.
         
         Args:
             samples: List of defect samples
-            token_map: Mapping from class name to learned token (e.g., "crazing" -> "<neu_crazing>")
+            token_map: Mapping from class name to learned token
             output_file: Optional path to save caption mapping
+            use_paper_keywords: If True, use paper-specified keywords
+            lora_weight: LoRA weight in prompt (typically 1.0)
             
         Returns:
-            Dictionary mapping image stem to keyword-based prompts with LoRA weight
+            Dictionary mapping image stem to paper-style prompts
         """
+        keyword_extractor = KeywordExtractor()
         captions: Dict[str, str] = {}
-        for sample in track(samples, description="Selecting CLIP prompts"):
+        
+        for sample in track(samples, description="Generating paper-style captions"):
             stem = sample.image_path.stem
             cls_name = sample.cls_name
             token = token_map.get(cls_name, cls_name.replace("_", " "))
-            candidates = self._build_candidates(cls_name, token)
-            image = Image.open(sample.image_path).convert("RGB")
-            prompt = self._select_prompt(image, candidates)
+            
+            base_keywords = keyword_extractor.PAPER_KEYWORDS
+            defect_keywords = keyword_extractor.DEFECT_SPECIFIC_KEYWORDS.get(
+                cls_name, [cls_name.replace("_", " ")]
+            )
+            
+            prompt = keyword_extractor.build_paper_style_prompt(
+                class_name=cls_name,
+                token=token,
+                base_keywords=base_keywords,
+                defect_specific=defect_keywords,
+                lora_weight=lora_weight,
+            )
+            
             captions[stem] = prompt
         
         if output_file:

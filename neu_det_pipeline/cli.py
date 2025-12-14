@@ -211,15 +211,30 @@ def caption(
     dataset_root: Path = typer.Argument(..., exists=True, file_okay=False),
     output_file: Path = typer.Option(Path("outputs/captions.json"), file_okay=True),
     model_name: str = typer.Option("openai/clip-vit-large-patch14"),
+    use_paper_keywords: bool = typer.Option(True, help="Use paper-specified keywords (paper format) or CLIP-selected templates"),
+    lora_weight: float = typer.Option(1.0, help="LoRA weight in prompt (typically 1.0)"),
 ) -> None:
-    """Generate automatic prompts for all images using CLIP ranking."""
+    """Generate automatic prompts using paper-style keyword format with LoRA weights.
+    
+    Paper format: "keyword1, keyword2, ..., defect-specific, loRA:token:weight"
+    Example: "grayscale, greyscale, hotrolled steel strip, monochrome, no humans, 
+             surface defects, texture, rolled-in scale, loRA:neudet1-v1:1"
+    """
     bundle = _ensure_bundle(ctx)
     samples = collect_dataset(dataset_root)
     token_map = {cls: f"<neu_{cls}>" for cls in set(s.cls_name for s in samples)}
     generator = CaptionGenerator(model_name=model_name)
-    captions = generator.generate_with_token(samples, token_map, output_file=output_file)
+    captions = generator.generate_with_token(
+        samples,
+        token_map,
+        output_file=output_file,
+        use_paper_keywords=use_paper_keywords,
+        lora_weight=lora_weight,
+    )
     generator.cleanup()
-    console.print(f"Generated {len(captions)} captions, saved to {output_file}")
+    console.print(f"Generated {len(captions)} paper-style captions, saved to {output_file}")
+    if use_paper_keywords:
+        console.print("[cyan]Using paper-specified keyword format[/cyan]")
 
 
 @app.command()

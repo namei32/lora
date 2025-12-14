@@ -6,8 +6,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
-
 
 @dataclass
 class DatasetConfig:
@@ -68,26 +66,24 @@ class GenerationConfig:
     base_model: str = "runwayml/stable-diffusion-v1-5"
     prompt_template: str = "a photo of {token}"
     hf_token: str | None = None
-    # Three ControlNets for: 1) original input features (canny edge from original),
-    # 2) contour features (HED-based soft edge), 3) depth map features (MiDaS)
+    # Two ControlNets as per paper: 1) HED contour features, 2) depth map features (MiDaS)
     controlnet_models: List[str] = field(
         default_factory=lambda: [
-            "lllyasviel/control_v11p_sd15_canny",      # Original input structure
             "lllyasviel/control_v11p_sd15_softedge",   # HED contour features
             "lllyasviel/control_v11f1p_sd15_depth",    # MiDaS depth features
         ]
     )
-    # Modalities correspond to guidance features: canny from original, HED contours, depth maps
-    controlnet_modalities: List[str] = field(default_factory=lambda: ["canny", "hed", "depth"])
-    num_inference_steps: int = 50  # SD default
-    guidance_scale: float = 7.5  # SD default
-    # Control scales: Canny default, HED 1.0, MiDaS 1.0 as per requirements
-    control_scales: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
-    control_start_steps: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
-    control_end_steps: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
-    denoising_strength: float = 0.2  # As per requirements
-    scheduler: str = "PNDMScheduler"  # SD default scheduler
-    seed: int = 42
+    # Modalities correspond to guidance features: HED contours, depth maps
+    controlnet_modalities: List[str] = field(default_factory=lambda: ["hed", "depth"])
+    num_inference_steps: int = 40  # Inference steps
+    guidance_scale: float = 7.0  # Per paper: CFG scale 7.0
+    # Control scales: HED 0.7, MiDaS 0.7 (ControlNet weights)
+    control_scales: List[float] = field(default_factory=lambda: [1.0, 1.0])
+    control_start_steps: List[float] = field(default_factory=lambda: [0.0, 0.0])
+    control_end_steps: List[float] = field(default_factory=lambda: [1.0, 1.0])
+    denoising_strength: float = 0.2 # Denoising strength
+    scheduler: str = "DPMSolverMultistepScheduler"  # DPM++ 2 M Karras (per paper)
+    seed: int = 865985793  # Paper-specified seed for reproducibility
 
 
 @dataclass
@@ -123,32 +119,30 @@ def _instantiate_config(cls: type, overrides: Optional[Dict[str, Any]]) -> Any:
     return cls(**init_kwargs)
 
 
-def _load_yaml(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"配置文件 {path} 的顶层必须是字典。")
-    return data
-
-
 def load_config_bundle(config_path: Optional[Path] = None) -> ConfigBundle:
-    resolved_path: Optional[Path]
+    """
+    Load configuration from dataclass defaults only.
+    YAML config files are no longer supported.
+    All configuration is defined in config.py dataclasses.
+    
+    Args:
+        config_path: Deprecated, ignored for backwards compatibility
+    """
     if config_path is not None:
-        resolved_path = config_path.expanduser().resolve()
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"未找到配置文件: {resolved_path}")
-    else:
-        resolved_path = DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.exists() else None
+        import warnings
+        warnings.warn(
+            "config_path parameter is deprecated. "
+            "Configuration is now loaded from config.py dataclass defaults only.",
+            DeprecationWarning,
+            stacklevel=2
+        )
 
-    defaults: Dict[str, Any] = {}
-    if resolved_path is not None:
-        defaults = _load_yaml(resolved_path).get("defaults", {})
-
-    dataset_cfg = _instantiate_config(DatasetConfig, defaults.get("dataset"))
-    textual_cfg = _instantiate_config(TextualInversionConfig, defaults.get("textual_inversion"))
-    lora_cfg = _instantiate_config(LoRAConfig, defaults.get("lora"))
-    guidance_cfg = _instantiate_config(GuidanceConfig, defaults.get("guidance"))
-    generation_cfg = _instantiate_config(GenerationConfig, defaults.get("generation"))
+    # Use dataclass defaults directly
+    dataset_cfg = DatasetConfig()
+    textual_cfg = TextualInversionConfig()
+    lora_cfg = LoRAConfig()
+    guidance_cfg = GuidanceConfig()
+    generation_cfg = GenerationConfig()
 
     return ConfigBundle(
         dataset=dataset_cfg,
@@ -156,5 +150,5 @@ def load_config_bundle(config_path: Optional[Path] = None) -> ConfigBundle:
         lora=lora_cfg,
         guidance=guidance_cfg,
         generation=generation_cfg,
-        source_path=resolved_path,
+        source_path=None,  # No YAML file source
     )
