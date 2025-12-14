@@ -12,7 +12,7 @@ self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR
 # 当前配置：channels = data.get("channels", 3)
 # → 默认加载为cv2.IMREAD_COLOR (BGR)
 ```
-
+123
 ## YOLO多尺度适配性分析
 
 ### ✅ 天然支持多通道输入
