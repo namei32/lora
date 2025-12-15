@@ -25,11 +25,17 @@ from .config import (
 )
 from .data import collect_dataset, split_dataset, compute_class_counts
 from .guidance import GuidanceExtractor, load_guidance_map
-from .caption import CaptionGenerator, load_captions_from_file
+from .caption import CaptionGenerator, load_captions_from_file, generate_captions_with_blip2
 from .textual_inversion import TextualInversionTrainer
 from .lora_train import LoRATrainer
 from .generation import ControlNetGenerator
 from .metrics import GenerationMetricsEvaluator, save_metrics
+
+# Import create_mixed_dataset from resplit_dataset.py
+resplit_module_path = Path(__file__).resolve().parent.parent
+if str(resplit_module_path) not in sys.path:
+    sys.path.insert(0, str(resplit_module_path))
+from resplit_dataset import create_mixed_dataset
 
 app = typer.Typer(add_completion=False)
 console = Console()
@@ -210,31 +216,58 @@ def caption(
     ctx: typer.Context,
     dataset_root: Path = typer.Argument(..., exists=True, file_okay=False),
     output_file: Path = typer.Option(Path("outputs/captions.json"), file_okay=True),
-    model_name: str = typer.Option("openai/clip-vit-large-patch14"),
+    model_name: str = typer.Option("openai/clip-vit-large-patch14", help="CLIP model name (ignored if --use-blip2 is set)"),
     use_paper_keywords: bool = typer.Option(True, help="Use paper-specified keywords (paper format) or CLIP-selected templates"),
     lora_weight: float = typer.Option(1.0, help="LoRA weight in prompt (typically 1.0)"),
+    use_blip2: bool = typer.Option(False, help="Use BLIP-2 for dynamic caption generation (better quality, slower)"),
+    blip2_model: str = typer.Option("Salesforce/blip2-opt-2.7b", help="BLIP-2 model name (only used if --use-blip2 is set)"),
+    combine_with_keywords: bool = typer.Option(True, help="Combine BLIP-2 descriptions with paper keywords (only used if --use-blip2 is set)"),
+    use_clip_selection: bool = typer.Option(False, help="Use CLIP to select best template for each image (slower but more accurate, only used if --use-blip2 is False)"),
 ) -> None:
     """Generate automatic prompts using paper-style keyword format with LoRA weights.
     
     Paper format: "keyword1, keyword2, ..., defect-specific, loRA:token:weight"
     Example: "grayscale, greyscale, hotrolled steel strip, monochrome, no humans, 
              surface defects, texture, rolled-in scale, loRA:neudet1-v1:1"
+    
+    With --use-blip2: Uses BLIP-2 to generate dynamic descriptions based on image content,
+    optionally combined with paper keywords for better Stable Diffusion compatibility.
     """
     bundle = _ensure_bundle(ctx)
     samples = collect_dataset(dataset_root)
     token_map = {cls: f"<neu_{cls}>" for cls in set(s.cls_name for s in samples)}
-    generator = CaptionGenerator(model_name=model_name)
-    captions = generator.generate_with_token(
-        samples,
-        token_map,
-        output_file=output_file,
-        use_paper_keywords=use_paper_keywords,
-        lora_weight=lora_weight,
-    )
-    generator.cleanup()
-    console.print(f"Generated {len(captions)} paper-style captions, saved to {output_file}")
-    if use_paper_keywords:
-        console.print("[cyan]Using paper-specified keyword format[/cyan]")
+    
+    if use_blip2:
+        console.print(f"[cyan]Using BLIP-2 model: {blip2_model}[/cyan]")
+        console.print("[yellow]BLIP-2 generation is slower but produces more detailed captions[/yellow]")
+        captions = generate_captions_with_blip2(
+            samples=samples,
+            token_map=token_map,
+            output_file=output_file,
+            use_paper_keywords=use_paper_keywords,
+            lora_weight=lora_weight,
+            model_name=blip2_model,
+            combine_with_keywords=combine_with_keywords,
+        )
+        console.print(f"Generated {len(captions)} BLIP-2 captions, saved to {output_file}")
+        if combine_with_keywords:
+            console.print("[cyan]BLIP-2 descriptions combined with paper keywords[/cyan]")
+    else:
+        generator = CaptionGenerator(model_name=model_name)
+        captions = generator.generate_with_token(
+            samples,
+            token_map,
+            output_file=output_file,
+            use_paper_keywords=use_paper_keywords,
+            lora_weight=lora_weight,
+            use_clip_selection=use_clip_selection,
+        )
+        generator.cleanup()
+        console.print(f"Generated {len(captions)} paper-style captions, saved to {output_file}")
+        if use_clip_selection:
+            console.print("[cyan]Using CLIP to select best template for each image[/cyan]")
+        elif use_paper_keywords:
+            console.print("[cyan]Using paper-specified keyword format (simple concatenation)[/cyan]")
 
 
 @app.command()
@@ -321,9 +354,20 @@ def generate(
     
     if not caption_file.exists():
         console.print(f"Caption file not found. Generating captions automatically...")
-        caption_generator = CaptionGenerator(model_name=model_name)
-        captions = caption_generator.generate_with_token(samples, token_map, output_file=caption_file)
-        caption_generator.cleanup()
+        # 默认使用 CLIP，但可以通过环境变量或配置启用 BLIP-2
+        use_blip2 = False  # 可以通过参数添加
+        if use_blip2:
+            captions = generate_captions_with_blip2(
+                samples=samples,
+                token_map=token_map,
+                output_file=caption_file,
+                use_paper_keywords=True,
+                lora_weight=1.0,
+            )
+        else:
+            caption_generator = CaptionGenerator(model_name=model_name)
+            captions = caption_generator.generate_with_token(samples, token_map, output_file=caption_file)
+            caption_generator.cleanup()
         console.print(f"Generated {len(captions)} captions, saved to {caption_file}")
     else:
         console.print(f"Loading captions from {caption_file}")
@@ -443,6 +487,54 @@ def generate(
         console.print(f"[green]YOLO 数据集已更新: {yolo_output}[/green]")
     except Exception as exc:  # noqa: BLE001 - we want to log and continue
         console.print(f"[yellow]prepare_yolo_dataset 运行失败: {exc}。请手动检查。[/yellow]")
+
+    # Automatically create mixed dataset after image generation
+    if generated_paths:
+        try:
+            console.print("[cyan]自动生成混合数据集...[/cyan]")
+            # Try to infer paths from dataset_root and output_dir
+            # First, try to find the project root (where resplit_dataset.py is located)
+            project_root = Path(__file__).resolve().parent.parent
+            
+            # Try to find original images directory
+            orig_images_dir = dataset_root / "IMAGES"
+            if not orig_images_dir.exists():
+                # Try project root / NEU-DET / IMAGES
+                orig_images_dir = project_root / "NEU-DET" / "IMAGES"
+            
+            # Try to find labels directory
+            orig_labels_dir = output_dir.parent / "yolo_baseline" / "labels"
+            if not orig_labels_dir.exists():
+                # Try project root / outputs / yolo_baseline / labels
+                orig_labels_dir = project_root / "outputs" / "yolo_baseline" / "labels"
+            
+            # Try to find manifest file
+            manifest_path = output_dir.parent / "split_manifest.json"
+            if not manifest_path.exists():
+                # Try project root / outputs / split_manifest.json
+                manifest_path = project_root / "outputs" / "split_manifest.json"
+            
+            # new_images_dir is the image_dir (run_dir / "images")
+            new_images_dir = image_dir
+            # run_output_dir will be set to run_dir / "mixed_dataset" by default
+            run_output_dir = run_dir / "mixed_dataset"
+            
+            # Only proceed if manifest exists
+            if manifest_path.exists():
+                create_mixed_dataset(
+                    orig_images_dir=orig_images_dir,
+                    orig_labels_dir=orig_labels_dir,
+                    manifest_path=manifest_path,
+                    new_images_dir=new_images_dir,
+                    run_output_dir=run_output_dir,
+                    seed=dataset_cfg.seed,
+                )
+                console.print(f"[green]混合数据集已生成: {run_output_dir}[/green]")
+            else:
+                console.print(f"[yellow]未找到 split_manifest.json ({manifest_path})，跳过混合数据集生成。[/yellow]")
+                console.print(f"[yellow]请确保 split_manifest.json 存在于 outputs 目录下。[/yellow]")
+        except Exception as exc:  # noqa: BLE001 - we want to log and continue
+            console.print(f"[yellow]混合数据集生成失败: {exc}。请手动检查。[/yellow]")
 
 
 if __name__ == "__main__":
