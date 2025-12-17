@@ -265,6 +265,20 @@ def generate(
     priority_class: Optional[str] = typer.Option(None, help="Prioritize generating this defect class first (e.g., 'inclusion')"),
     max_samples: Optional[int] = typer.Option(None, help="Limit the number of samples to generate (for quick smoke tests)"),
     model_name: str = typer.Option("openai/clip-vit-large-patch14", help="CLIP model for prompt selection"),
+    mode: str = typer.Option(
+        "a2",
+        help="Generation preset: a1(mask only), a2(mask+HED), a3(mask+HED+Depth)",
+        case_sensitive=False,
+    ),
+    use_bbox_mask: bool = typer.Option(True, help="Apply soft bbox mask blending to keep background intact"),
+    skip_large_bbox: bool = typer.Option(
+        True,
+        help="Skip samples whose bbox covers too much area (prevents full-image inpaint artifacts)",
+    ),
+    skip_large_bbox_ratio: float = typer.Option(
+        0.6,
+        help="Skip when bbox_area/(image_area) >= this ratio (suggest 0.6~0.8)",
+    ),
     log_file: Optional[Path] = typer.Option(None, help="日志文件路径 (默认: 每次生成独立 run_xxx/run.log)"),
 ) -> None:
     """Generate images with LoRA and ControlNet using auto-generated captions."""
@@ -288,11 +302,81 @@ def generate(
         console.print(f"Prioritizing generation for class: {priority_class}")
         samples = sorted(samples, key=lambda s: (s.cls_name != priority_class, s.image_path.stem))
 
+    # Skip samples with overly-large bbox (inpaint would degenerate into full-image redraw)
+    skipped_large_bbox_stems: List[str] = []
+    if use_bbox_mask and skip_large_bbox:
+        from xml.etree import ElementTree as ET
+
+        ratio_thr = float(skip_large_bbox_ratio)
+        if ratio_thr <= 0:
+            ratio_thr = 0.6
+        if ratio_thr > 1.0:
+            ratio_thr = 1.0
+
+        kept: List[Any] = []
+        for s in samples:
+            # Default NEU-DET size is 200x200; prefer reading from XML for robustness
+            w = h = 200
+            try:
+                tree = ET.parse(s.annotation_path)
+                w = int(tree.findtext("size/width") or w)
+                h = int(tree.findtext("size/height") or h)
+            except Exception:
+                pass
+            xmin, ymin, xmax, ymax = s.bbox
+            bbox_area = max(0, xmax - xmin) * max(0, ymax - ymin)
+            img_area = max(1, w * h)
+            ratio = bbox_area / img_area
+            if ratio >= ratio_thr:
+                skipped_large_bbox_stems.append(s.image_path.stem)
+            else:
+                kept.append(s)
+
+        if skipped_large_bbox_stems:
+            console.print(
+                f"[yellow]Skipping {len(skipped_large_bbox_stems)} sample(s) with large bbox "
+                f"(ratio >= {ratio_thr:.2f}), e.g. {skipped_large_bbox_stems[:5]}[/yellow]"
+            )
+        samples = kept
+
     if max_samples is not None:
         samples = samples[:max_samples]
         console.print(f"Limiting generation to {len(samples)} sample(s) for this run.")
     
     cfg = replace(bundle.generation)
+    mode_lc = mode.lower()
+    if mode_lc == "a1":
+        cfg.controlnet_models = []
+        cfg.controlnet_modalities = []
+        cfg.control_scales = []
+        cfg.num_inference_steps = 40
+        cfg.denoising_strength = 0.65
+        console.print("[cyan]Mode A1: mask-only img2img (no ControlNet)[/cyan]")
+    elif mode_lc == "a2":
+        cfg.controlnet_models = ["lllyasviel/control_v11p_sd15_softedge"]
+        cfg.controlnet_modalities = ["hed"]
+        cfg.control_scales = [1.0]
+        cfg.num_inference_steps = 40
+        cfg.denoising_strength = 0.65
+        console.print("[cyan]Mode A2: mask + HED ControlNet (scale=1.0)[/cyan]")
+    elif mode_lc == "a3":
+        cfg.controlnet_models = [
+            "lllyasviel/control_v11p_sd15_softedge",
+            "lllyasviel/control_v11f1p_sd15_depth",
+        ]
+        cfg.controlnet_modalities = ["hed", "depth"]
+        cfg.control_scales = [1.0, 1.0]
+        cfg.num_inference_steps = 40
+        cfg.denoising_strength = 0.65
+        console.print("[cyan]Mode A3: mask + HED+Depth ControlNet (depth=0.5)[/cyan]")
+    else:
+        console.print(f"[yellow]未知模式 {mode}，使用默认生成配置。[/yellow]")
+
+    # If bbox inpaint is enabled, prefer an inpainting base model (keeps background texture much better)
+    if use_bbox_mask and cfg.base_model == "runwayml/stable-diffusion-v1-5":
+        cfg.base_model = "runwayml/stable-diffusion-inpainting"
+        console.print("[cyan]Inpaint enabled: switching base_model -> runwayml/stable-diffusion-inpainting[/cyan]")
+
     generator = ControlNetGenerator(cfg)
     lora_defaults = replace(bundle.lora)
     lora_metadata = _load_lora_metadata(lora_path, lora_defaults)
@@ -352,18 +436,44 @@ def generate(
             shutil.copy2(lora_config_path, lora_config_dest)
         artifact_paths["lora_config"] = str(lora_config_dest.resolve())
     
-    # Build prompt items using auto-generated captions
-    prompt_items = [(s.image_path.stem, captions.get(s.image_path.stem, f"macro shot of {token_map[s.cls_name]} steel surface")) for s in samples]
+    # Build prompt items using auto-generated captions.
+    # Always append the textual inversion token to ensure it is actually used in the prompt.
+    prompt_items = []
+    for s in samples:
+        token = token_map[s.cls_name]
+        base_prompt = captions.get(s.image_path.stem, f"macro shot of {token} steel surface")
+        prompt_items.append((s.image_path.stem, f"{base_prompt}, {token}"))
     
-    conditioning = load_guidance_map(samples, guidance_dir, cfg.controlnet_modalities)
+    if cfg.controlnet_modalities:
+        conditioning = load_guidance_map(samples, guidance_dir, cfg.controlnet_modalities)
+    else:
+        conditioning = {}
+
     init_images = {s.image_path.stem: s.image_path for s in samples}
-    generated_paths = generator.generate(lora_path, prompt_items, conditioning, image_dir, init_images=init_images)
+    bbox_map = {s.image_path.stem: s.bbox for s in samples}
+    generated_paths = generator.generate(
+        lora_path,
+        prompt_items,
+        conditioning,
+        image_dir,
+        init_images=init_images,
+        bbox_map=bbox_map,
+        use_bbox_mask=use_bbox_mask,
+    )
 
     manifest: Dict[str, object]
     if generated_paths:
         metrics_dest = run_dir / "metrics.json"
         evaluator = GenerationMetricsEvaluator()
-        metric_result = evaluator.evaluate(generated_paths, init_images, conditioning)
+        # When bbox-mask inpaint is enabled, evaluate metrics on bbox region only
+        metric_bbox_map = bbox_map if use_bbox_mask else None
+        metric_result = evaluator.evaluate(
+            generated_paths,
+            init_images,
+            conditioning,
+            bbox_map=metric_bbox_map,
+            bbox_source_size=(200, 200),
+        )
         run_details = {
             "timestamp": timestamp,
             "generated_images": len(generated_paths),
@@ -379,6 +489,10 @@ def generate(
             "device": str(evaluator.device),
             "output_directory": str(image_dir.resolve()),
             "max_samples": max_samples,
+            "skip_large_bbox": bool(skip_large_bbox),
+            "skip_large_bbox_ratio": float(skip_large_bbox_ratio),
+            "skipped_large_bbox_count": len(skipped_large_bbox_stems),
+            "skipped_large_bbox_stems": skipped_large_bbox_stems[:50],
         }
         save_metrics(metric_result, metrics_dest, extra=run_details)
         artifact_paths["metrics"] = str(metrics_dest.resolve())
@@ -411,6 +525,10 @@ def generate(
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "output_directory": str(image_dir.resolve()),
             "max_samples": max_samples,
+            "skip_large_bbox": bool(skip_large_bbox),
+            "skip_large_bbox_ratio": float(skip_large_bbox_ratio),
+            "skipped_large_bbox_count": len(skipped_large_bbox_stems),
+            "skipped_large_bbox_stems": skipped_large_bbox_stems[:50],
             "log_file": str(effective_log.resolve()) if effective_log else None,
             "metrics_file": None,
             "caption_file": str(caption_file.resolve()) if caption_file else None,
@@ -425,24 +543,44 @@ def generate(
     manifest_path = run_dir / "run_context.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
 
-    # Automatically refresh YOLO dataset with latest generated images
-    try:
-        console.print("[cyan]自动运行 prepare_yolo_dataset.py 以更新 YOLO 数据集...[/cyan]")
-        prepare_script = Path(__file__).resolve().parent.parent / "prepare_yolo_dataset.py"
-        # Place the refreshed YOLO dataset inside the current run folder
-        yolo_output = run_dir / "yolo_dataset"
-        cmd = [
-            sys.executable,
-            str(prepare_script),
-            str(dataset_root),
-            str(image_dir),
-            "--output-dir",
-            str(yolo_output),
-        ]
-        subprocess.run(cmd, check=True)
-        console.print(f"[green]YOLO 数据集已更新: {yolo_output}[/green]")
-    except Exception as exc:  # noqa: BLE001 - we want to log and continue
-        console.print(f"[yellow]prepare_yolo_dataset 运行失败: {exc}。请手动检查。[/yellow]")
+    # Automatically create mixed dataset using resplit_dataset.py
+    resplit_script = Path(__file__).resolve().parent.parent / "resplit_dataset.py"
+    if resplit_script.exists():
+        try:
+            console.print("[cyan]自动运行 resplit_dataset.py 以创建混合数据集...[/cyan]")
+            # Infer paths for resplit_dataset.py
+            orig_images_dir = dataset_root / "IMAGES"
+            manifest_path = output_dir.parent / "split_manifest.json"
+            yolo_baseline_dir = output_dir.parent / "yolo_baseline"
+            orig_labels_dir = yolo_baseline_dir / "labels" if yolo_baseline_dir.exists() else output_dir.parent / "yolo_baseline" / "labels"
+            mixed_output = run_dir / "mixed_dataset"
+            
+            cmd = [
+                sys.executable,
+                str(resplit_script),
+                "--orig_images_dir", str(orig_images_dir),
+                "--orig_labels_dir", str(orig_labels_dir),
+                "--manifest_path", str(manifest_path),
+                "--new_images_dir", str(image_dir),
+                "--run_output_dir", str(mixed_output),
+            ]
+            
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if result.returncode == 0:
+                console.print(f"[green]混合数据集已创建: {mixed_output}[/green]")
+            else:
+                console.print(f"[yellow]resplit_dataset.py 运行失败 (exit code {result.returncode})[/yellow]")
+                if result.stderr:
+                    console.print(f"[yellow]错误信息: {result.stderr[:300]}[/yellow]")
+                if result.stdout:
+                    console.print(f"[yellow]输出: {result.stdout[:300]}[/yellow]")
+        except Exception as exc:  # noqa: BLE001 - we want to log and continue
+            console.print(f"[yellow]resplit_dataset.py 运行失败: {exc}。请手动检查。[/yellow]")
+    else:
+        console.print(
+            f"[yellow]resplit_dataset.py 未找到 ({resplit_script})，跳过混合数据集自动创建。"
+            f"请手动运行 resplit_dataset.py 创建混合数据集。[/yellow]"
+        )
 
 
 if __name__ == "__main__":

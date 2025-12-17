@@ -66,6 +66,9 @@ class GenerationConfig:
     base_model: str = "runwayml/stable-diffusion-v1-5"
     prompt_template: str = "a photo of {token}"
     hf_token: str | None = None
+    # Soft mask parameters for bbox-constrained blending
+    mask_margin_ratio: float = 0.15  # expand bbox by 15% on each side
+    mask_feather_ratio: float = 0.08  # feather radius relative to image size
     # Two ControlNets as per paper: 1) HED contour features, 2) depth map features (MiDaS)
     controlnet_models: List[str] = field(
         default_factory=lambda: [
@@ -78,7 +81,7 @@ class GenerationConfig:
     num_inference_steps: int = 40  # Inference steps
     guidance_scale: float = 7.0  # Per paper: CFG scale 7.0
     # Control scales: HED 0.7, MiDaS 0.7 (ControlNet weights)
-    control_scales: List[float] = field(default_factory=lambda: [1.0, 1.0])
+    control_scales: List[float] = field(default_factory=lambda: [1.0, 0.5])
     control_start_steps: List[float] = field(default_factory=lambda: [0.0, 0.0])
     control_end_steps: List[float] = field(default_factory=lambda: [1.0, 1.0])
     denoising_strength: float = 0.2 # Denoising strength

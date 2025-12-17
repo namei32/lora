@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -107,11 +107,75 @@ class GenerationMetricsEvaluator:
         tensor = self.transform(img).unsqueeze(0).to(self.device)
         return tensor
 
-    def _edge_ssim(self, generated_path: Path, reference_canny: Path) -> Optional[float]:
+    @staticmethod
+    def _scale_bbox(
+        bbox: Tuple[int, int, int, int],
+        *,
+        src_size: Tuple[int, int],
+        dst_size: Tuple[int, int],
+    ) -> Tuple[int, int, int, int]:
+        """Scale bbox coordinates from src_size to dst_size."""
+        xmin, ymin, xmax, ymax = bbox
+        src_w, src_h = src_size
+        dst_w, dst_h = dst_size
+        sx = dst_w / max(src_w, 1)
+        sy = dst_h / max(src_h, 1)
+        return (
+            int(xmin * sx),
+            int(ymin * sy),
+            int(xmax * sx),
+            int(ymax * sy),
+        )
+
+    @staticmethod
+    def _crop_pil(img: Image.Image, bbox: Tuple[int, int, int, int]) -> Image.Image:
+        """Crop PIL image by bbox (clamped)."""
+        w, h = img.size
+        xmin, ymin, xmax, ymax = bbox
+        x0 = max(0, min(w, xmin))
+        y0 = max(0, min(h, ymin))
+        x1 = max(0, min(w, xmax))
+        y1 = max(0, min(h, ymax))
+        # Avoid empty crop
+        if x1 <= x0 + 1 or y1 <= y0 + 1:
+            return img
+        return img.crop((x0, y0, x1, y1))
+
+    def _load_tensor_bbox(
+        self,
+        *,
+        path: Path,
+        bbox: Tuple[int, int, int, int],
+        bbox_src_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Load image, crop to bbox (scaled from bbox_src_size), then apply transform."""
+        img = Image.open(path).convert("RGB")
+        scaled = self._scale_bbox(bbox, src_size=bbox_src_size, dst_size=img.size)
+        cropped = self._crop_pil(img, scaled)
+        return self.transform(cropped).unsqueeze(0).to(self.device)
+
+    def _edge_ssim(
+        self,
+        generated_path: Path,
+        reference_canny: Path,
+        *,
+        bbox: Optional[Tuple[int, int, int, int]] = None,
+        bbox_src_size: Optional[Tuple[int, int]] = None,
+    ) -> Optional[float]:
         gen = cv2.imread(str(generated_path), cv2.IMREAD_GRAYSCALE)
         ref = cv2.imread(str(reference_canny), cv2.IMREAD_GRAYSCALE)
         if gen is None or ref is None:
             return None
+        if bbox is not None and bbox_src_size is not None:
+            # Scale bbox to both gen/ref sizes, then crop
+            bx_g = self._scale_bbox(bbox, src_size=bbox_src_size, dst_size=(gen.shape[1], gen.shape[0]))
+            bx_r = self._scale_bbox(bbox, src_size=bbox_src_size, dst_size=(ref.shape[1], ref.shape[0]))
+            x0, y0, x1, y1 = bx_g
+            gen = gen[max(0, y0): max(0, y1), max(0, x0): max(0, x1)]
+            x0, y0, x1, y1 = bx_r
+            ref = ref[max(0, y0): max(0, y1), max(0, x0): max(0, x1)]
+            if gen.size == 0 or ref.size == 0:
+                return None
         gen_canny = cv2.Canny(gen, 60, 160)
         ref_resized = cv2.resize(ref, (gen_canny.shape[1], gen_canny.shape[0]), interpolation=cv2.INTER_AREA)
         gen_float = gen_canny.astype(np.float32) / 255.0
@@ -123,6 +187,9 @@ class GenerationMetricsEvaluator:
         generated_paths: Sequence[Path],
         reference_map: Dict[str, Path],
         guidance_map: Optional[Dict[str, Dict[str, Path]]] = None,
+        *,
+        bbox_map: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
+        bbox_source_size: Tuple[int, int] = (200, 200),
     ) -> MetricResult:
         lpips_scores: List[float] = []
         edge_scores: List[float] = []
@@ -137,8 +204,13 @@ class GenerationMetricsEvaluator:
                 missing_refs.append(stem)
                 continue
             try:
-                real_tensor = self._load_tensor(ref_path)
-                fake_tensor = self._load_tensor(gen_path)
+                if bbox_map is not None and stem in bbox_map:
+                    bbox = bbox_map[stem]
+                    real_tensor = self._load_tensor_bbox(path=ref_path, bbox=bbox, bbox_src_size=bbox_source_size)
+                    fake_tensor = self._load_tensor_bbox(path=gen_path, bbox=bbox, bbox_src_size=bbox_source_size)
+                else:
+                    real_tensor = self._load_tensor(ref_path)
+                    fake_tensor = self._load_tensor(gen_path)
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[yellow]跳过 {gen_path}，无法载入图像: {exc}[/yellow]")
                 failed_samples.append(stem)
@@ -153,7 +225,15 @@ class GenerationMetricsEvaluator:
             if guidance_map:
                 canny_path = guidance_map.get(stem, {}).get("canny")
                 if canny_path and canny_path.exists():
-                    edge_value = self._edge_ssim(gen_path, canny_path)
+                    if bbox_map is not None and stem in bbox_map:
+                        edge_value = self._edge_ssim(
+                            gen_path,
+                            canny_path,
+                            bbox=bbox_map[stem],
+                            bbox_src_size=bbox_source_size,
+                        )
+                    else:
+                        edge_value = self._edge_ssim(gen_path, canny_path)
                     if edge_value is not None:
                         edge_scores.append(edge_value)
 

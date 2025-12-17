@@ -3,13 +3,14 @@ from __future__ import annotations
 import os
 import logging
 from pathlib import Path
-from typing import Dict, List, Sequence, Optional
+from typing import Dict, List, Sequence, Optional, Any
 
 import torch
 from diffusers import (
     ControlNetModel,
     StableDiffusionControlNetPipeline,
     StableDiffusionControlNetImg2ImgPipeline,
+    StableDiffusionImg2ImgPipeline,
 )
 from diffusers.schedulers import (
     DDIMScheduler,
@@ -18,7 +19,7 @@ from diffusers.schedulers import (
     EulerDiscreteScheduler,
     PNDMScheduler,
 )
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 from rich.console import Console
 from rich.progress import track
 from safetensors.torch import load_file
@@ -35,6 +36,12 @@ SCHEDULER_REGISTRY = {
 }
 
 logger = logging.getLogger(__name__)
+
+try:  # Optional: only required when using bbox inpaint modes
+    from diffusers import StableDiffusionInpaintPipeline, StableDiffusionControlNetInpaintPipeline  # type: ignore
+except Exception:  # noqa: BLE001
+    StableDiffusionInpaintPipeline = None  # type: ignore[assignment]
+    StableDiffusionControlNetInpaintPipeline = None  # type: ignore[assignment]
 
 
 class ControlNetGenerator:
@@ -120,7 +127,60 @@ class ControlNetGenerator:
         control_nets: Sequence[ControlNetModel],
         *,
         use_img2img: bool = False,
-    ) -> StableDiffusionControlNetPipeline:
+        use_inpaint: bool = False,
+    ) -> Any:
+        # Inpaint pipelines (mask inside repaint; outside locked)
+        if use_inpaint:
+            if len(control_nets) == 0:
+                if StableDiffusionInpaintPipeline is None:
+                    raise RuntimeError(
+                        "当前 diffusers 环境不支持 StableDiffusionInpaintPipeline。"
+                        "请升级 diffusers，或改用 img2img+后处理混合。"
+                    )
+                try:
+                    pipe = StableDiffusionInpaintPipeline.from_pretrained(  # type: ignore[misc]
+                        self.cfg.base_model,
+                        torch_dtype=torch.float16,
+                        safety_checker=None,
+                        use_auth_token=self._auth_token(),
+                    )
+                except OSError as exc:
+                    hint = "建议使用 inpainting 版本基础模型（例如 runwayml/stable-diffusion-inpainting）。"
+                    raise OSError(f"无法加载 inpaint 基础模型 '{self.cfg.base_model}': {exc}. {hint}") from exc
+                return pipe
+
+            if StableDiffusionControlNetInpaintPipeline is None:
+                raise RuntimeError(
+                    "当前 diffusers 环境不支持 StableDiffusionControlNetInpaintPipeline。"
+                    "请升级 diffusers。"
+                )
+            try:
+                pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(  # type: ignore[misc]
+                    self.cfg.base_model,
+                    controlnet=list(control_nets),
+                    torch_dtype=torch.float16,
+                    safety_checker=None,
+                    use_auth_token=self._auth_token(),
+                )
+            except OSError as exc:
+                hint = "建议使用 inpainting 版本基础模型（例如 runwayml/stable-diffusion-inpainting）。"
+                raise OSError(f"无法加载 ControlNet inpaint 基础模型 '{self.cfg.base_model}': {exc}. {hint}") from exc
+            return pipe
+
+        # If no ControlNet is requested (A1), fall back to plain SD img2img pipeline
+        if len(control_nets) == 0:
+            try:
+                pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+                    self.cfg.base_model,
+                    torch_dtype=torch.float16,
+                    safety_checker=None,
+                    use_auth_token=self._auth_token(),
+                )
+            except OSError as exc:
+                hint = "请确保 base_model 指向合法的 Stable Diffusion 目录 (含 model_index.json / unet / vae 等)。"
+                raise OSError(f"无法加载基础模型 '{self.cfg.base_model}': {exc}. {hint}") from exc
+            return pipe  # type: ignore[return-value]
+
         try:
             pipe_cls = (
                 StableDiffusionControlNetImg2ImgPipeline if use_img2img else StableDiffusionControlNetPipeline
@@ -263,12 +323,64 @@ class ControlNetGenerator:
                 f"无法加载 LoRA 权重 {lora_path}: {exc}\n最近一次 diffusers 加载错误: {last_error}"
             ) from exc
 
+    def _load_textual_inversion_embeddings(self, pipe: Any, embeddings_dir: Path) -> None:
+        """
+        Load textual inversion embeddings saved by our trainer (dict with 'token'/'embedding').
+        This enables prompts containing <neu_xxx> tokens to actually influence generation.
+        """
+        try:
+            tokenizer = pipe.tokenizer
+            text_encoder = pipe.text_encoder
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pipeline lacks tokenizer/text_encoder; skipping textual inversion load: %s", exc)
+            return
+
+        embeddings_dir = Path(embeddings_dir)
+        embedding_files = list(embeddings_dir.glob("*_embedding.pt"))
+        if not embedding_files:
+            logger.info("No textual inversion embeddings found in %s", embeddings_dir)
+            return
+
+        logger.info("Loading %d textual inversion embedding(s) from %s", len(embedding_files), embeddings_dir)
+        loaded = 0
+        for emb_file in embedding_files:
+            cls_name = emb_file.stem.replace("_embedding", "")
+            token = f"<neu_{cls_name}>"
+            checkpoint = torch.load(emb_file, map_location=text_encoder.device)
+            if isinstance(checkpoint, dict) and "embedding" in checkpoint:
+                embedding = checkpoint["embedding"]
+            else:
+                embedding = checkpoint
+            if not hasattr(embedding, "shape"):
+                logger.warning("Invalid embedding file %s; skipping", emb_file)
+                continue
+            embedding = embedding.to(text_encoder.device)
+
+            num_added = tokenizer.add_tokens(token)
+            if num_added == 0:
+                # Token exists; still ensure embedding is set (overwrites to be safe)
+                token_id = tokenizer.convert_tokens_to_ids(token)
+                try:
+                    text_encoder.get_input_embeddings().weight.data[token_id] = embedding
+                    loaded += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to set existing token embedding %s: %s", token, exc)
+                continue
+
+            text_encoder.resize_token_embeddings(len(tokenizer))
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            text_encoder.get_input_embeddings().weight.data[token_id] = embedding
+            loaded += 1
+
+        logger.info("Loaded %d textual inversion token(s)", loaded)
+
     def build_pipeline(
         self,
         lora_path: Path,
         *,
         use_img2img: bool = False,
-    ) -> StableDiffusionControlNetPipeline:
+        use_inpaint: bool = False,
+    ) -> Any:
         # Enforce discrete GPU usage (no CPU/iGPU fallback)
         device = self._require_discrete_cuda()
         torch.cuda.empty_cache()
@@ -276,8 +388,16 @@ class ControlNetGenerator:
         logger.info("Building pipeline (img2img=%s) with base model %s", use_img2img, self.cfg.base_model)
         control_nets = self._load_controlnets()
         logger.info("Loaded %d ControlNet(s)", len(control_nets))
-        pipe = self._build_base_pipe(control_nets, use_img2img=use_img2img)
+        pipe = self._build_base_pipe(control_nets, use_img2img=use_img2img, use_inpaint=use_inpaint)
         self._configure_scheduler(pipe)
+        # Auto-load textual inversion embeddings if present next to LoRA output
+        # Typical layout: outputs/lora/lora.safetensors and outputs/textual_inversion/*_embedding.pt
+        try:
+            embeddings_dir = Path(lora_path).parent.parent / "textual_inversion"
+            if embeddings_dir.exists():
+                self._load_textual_inversion_embeddings(pipe, embeddings_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to auto-load textual inversion embeddings: %s", exc)
         self._load_lora(pipe, lora_path)
         logger.info("LoRA weights loaded from %s", lora_path)
         
@@ -294,8 +414,12 @@ class ControlNetGenerator:
         
         # Set to eval mode for inference
         pipe.unet.eval()
-        for cn in pipe.controlnet if isinstance(pipe.controlnet, list) else [pipe.controlnet]:
-            cn.eval()
+        if hasattr(pipe, "controlnet"):
+            controlnets = pipe.controlnet if isinstance(pipe.controlnet, list) else [pipe.controlnet]
+            for cn in controlnets:
+                if cn is None:
+                    continue
+                cn.eval()
         
         return pipe
 
@@ -338,17 +462,72 @@ class ControlNetGenerator:
             images.append(img)
         return images
 
-    def _load_init_image(self, stem: str, init_images: Dict[str, Path]) -> Image.Image:
+    def _load_init_image(self, stem: str, init_images: Dict[str, Path]) -> tuple[Image.Image, tuple[int, int]]:
         if stem not in init_images:
             raise KeyError(f"缺少样本 {stem} 的原始图像，无法执行细节保持 img2img。")
         image_path = Path(init_images[stem])
         if not image_path.exists():
             raise FileNotFoundError(f"找不到用于 img2img 的原始图像: {image_path}")
         img = Image.open(image_path).convert("RGB")
+        orig_size = img.size
         target_size = (512, 512)
         if img.size != target_size:
             img = img.resize(target_size, Image.Resampling.LANCZOS)
-        return img
+        return img, orig_size
+
+    # ------------------------------------------------------------------
+    # Mask utilities
+    # ------------------------------------------------------------------
+    def _make_soft_mask(
+        self,
+        bbox: tuple[int, int, int, int],
+        target_size: tuple[int, int],
+        original_size: tuple[int, int],
+    ) -> Image.Image:
+        """
+        Build a soft mask (white=replace, black=keep original) from bbox with margin and feather.
+        """
+        width, height = target_size
+        orig_w, orig_h = original_size
+        xmin, ymin, xmax, ymax = bbox
+
+        # Scale bbox from original resolution to target resolution
+        scale_x = width / max(orig_w, 1)
+        scale_y = height / max(orig_h, 1)
+        xmin = int(xmin * scale_x)
+        xmax = int(xmax * scale_x)
+        ymin = int(ymin * scale_y)
+        ymax = int(ymax * scale_y)
+
+        margin_x = int((xmax - xmin) * self.cfg.mask_margin_ratio)
+        margin_y = int((ymax - ymin) * self.cfg.mask_margin_ratio)
+        x0 = max(0, xmin - margin_x)
+        y0 = max(0, ymin - margin_y)
+        x1 = min(width, xmax + margin_x)
+        y1 = min(height, ymax + margin_y)
+
+        mask = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rectangle([x0, y0, x1, y1], fill=255)
+
+        radius = max(width, height) * self.cfg.mask_feather_ratio
+        if radius > 0:
+            mask = mask.filter(ImageFilter.GaussianBlur(radius=radius))
+        return mask
+
+    def _blend_with_mask(
+        self,
+        base_img: Image.Image,
+        gen_img: Image.Image,
+        mask: Image.Image,
+    ) -> Image.Image:
+        """
+        Composite generated image onto base image using mask (white=gen, black=base).
+        """
+        base_rgb = base_img.convert("RGB")
+        gen_rgb = gen_img.convert("RGB")
+        mask_l = mask.convert("L")
+        return Image.composite(gen_rgb, base_rgb, mask_l)
 
     # ------------------------------------------------------------------
     # Public API
@@ -360,18 +539,25 @@ class ControlNetGenerator:
         conditioning: Dict[str, Dict[str, Path]],
         output_dir: Path,
         init_images: Optional[Dict[str, Path]] = None,
+        bbox_map: Optional[Dict[str, tuple[int, int, int, int]]] = None,
+        use_bbox_mask: bool = True,
     ) -> List[Path]:
         self._ensure_lengths()
         use_img2img = bool(init_images)
-        pipe = self.build_pipeline(lora_path, use_img2img=use_img2img)
+        use_inpaint = bool(use_bbox_mask and bbox_map and init_images)
+        if use_inpaint and init_images is None:
+            raise RuntimeError("启用 bbox mask 时必须提供 init_images（inpaint 需要原图）。")
+        pipe = self.build_pipeline(lora_path, use_img2img=use_img2img, use_inpaint=use_inpaint)
         output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
-            "Starting generation for %d prompt(s); img2img=%s; output_dir=%s",
+            "Starting generation for %d prompt(s); img2img=%s; inpaint=%s; output_dir=%s",
             len(prompt_items),
             use_img2img,
+            use_inpaint,
             output_dir,
         )
 
+        has_control = len(self.cfg.controlnet_models) > 0
         results: List[Path] = []
         for idx, (stem, prompt) in enumerate(track(prompt_items, description="Generating")):
             logger.info("[%d/%d] Generating '%s'", idx + 1, len(prompt_items), stem)
@@ -379,33 +565,78 @@ class ControlNetGenerator:
                 # Clear CUDA cache before each generation; fail fast on CUDA context errors
                 self._safe_empty_cache()
                 
-                ctrl_images = self._load_condition_images(stem, conditioning)
-                # If only one ControlNet is in use, we must pass a single image instead of a list
-                cond_image = ctrl_images[0] if len(ctrl_images) == 1 else ctrl_images
+                cond_image = None
+                if has_control:
+                    ctrl_images = self._load_condition_images(stem, conditioning)
+                    # Always pass as list: required for multiple ControlNets, and safe for single ControlNet
+                    # _load_condition_images always returns a list, but ensure it's definitely a list
+                    cond_image = list(ctrl_images) if ctrl_images else []
                 
                 # Generate with error handling and type safety
                 with torch.inference_mode():
                     if use_img2img:
                         if init_images is None:
                             raise RuntimeError("init_images 缺失，无法执行 img2img 以保留纹理细节。")
-                        init_image = self._load_init_image(stem, init_images)
-                        output = pipe(
-                            prompt,
-                            image=init_image,
-                            control_image=cond_image,
-                            num_inference_steps=self.cfg.num_inference_steps,
-                            guidance_scale=self.cfg.guidance_scale,
-                            strength=self.cfg.denoising_strength,
-                            controlnet_conditioning_scale=self.cfg.control_scales,
-                        )
+                        init_image, orig_size = self._load_init_image(stem, init_images)
+
+                        if use_inpaint:
+                            if bbox_map is None or stem not in bbox_map:
+                                raise KeyError(f"缺少样本 {stem} 的 bbox，无法执行 inpaint。")
+                            mask = self._make_soft_mask(bbox_map[stem], init_image.size, orig_size)
+                            if has_control:
+                                output = pipe(
+                                    prompt,
+                                    image=init_image,
+                                    mask_image=mask,
+                                    control_image=cond_image,
+                                    num_inference_steps=self.cfg.num_inference_steps,
+                                    guidance_scale=self.cfg.guidance_scale,
+                                    strength=self.cfg.denoising_strength,
+                                    controlnet_conditioning_scale=self.cfg.control_scales,
+                                )
+                            else:
+                                output = pipe(
+                                    prompt,
+                                    image=init_image,
+                                    mask_image=mask,
+                                    num_inference_steps=self.cfg.num_inference_steps,
+                                    guidance_scale=self.cfg.guidance_scale,
+                                    strength=self.cfg.denoising_strength,
+                                )
+                        else:
+                            if has_control:
+                                output = pipe(
+                                    prompt,
+                                    image=init_image,
+                                    control_image=cond_image,
+                                    num_inference_steps=self.cfg.num_inference_steps,
+                                    guidance_scale=self.cfg.guidance_scale,
+                                    strength=self.cfg.denoising_strength,
+                                    controlnet_conditioning_scale=self.cfg.control_scales,
+                                )
+                            else:
+                                output = pipe(
+                                    prompt,
+                                    image=init_image,
+                                    num_inference_steps=self.cfg.num_inference_steps,
+                                    guidance_scale=self.cfg.guidance_scale,
+                                    strength=self.cfg.denoising_strength,
+                                )
                     else:
-                        output = pipe(
-                            prompt,
-                            num_inference_steps=self.cfg.num_inference_steps,
-                            guidance_scale=self.cfg.guidance_scale,
-                            image=cond_image,
-                            controlnet_conditioning_scale=self.cfg.control_scales,
-                        )
+                        if has_control:
+                            output = pipe(
+                                prompt,
+                                num_inference_steps=self.cfg.num_inference_steps,
+                                guidance_scale=self.cfg.guidance_scale,
+                                image=cond_image,
+                                controlnet_conditioning_scale=self.cfg.control_scales,
+                            )
+                        else:
+                            output = pipe(
+                                prompt,
+                                num_inference_steps=self.cfg.num_inference_steps,
+                                guidance_scale=self.cfg.guidance_scale,
+                            )
                     image = output.images[0]
                 
                 out_path = output_dir / f"{stem}.png"

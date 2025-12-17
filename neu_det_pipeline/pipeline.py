@@ -86,5 +86,14 @@ def run_full_pipeline(
     #   allowing reuse of existing annotations
     generator = ControlNetGenerator(gen_cfg)
     prompt_items = [(s.image_path.stem, gen_cfg.prompt_template.format(token=token_map[s.cls_name])) for s in samples]
-   init_images = {s.image_path.stem: s.image_path for s in samples}
-   generator.generate(lora_path, prompt_items, conditioning, gen_dir, init_images=init_images)
+    init_images = {s.image_path.stem: s.image_path for s in samples}
+    bbox_map = {s.image_path.stem: s.bbox for s in samples}
+    generator.generate(
+        lora_path,
+        prompt_items,
+        conditioning,
+        gen_dir,
+        init_images=init_images,
+        bbox_map=bbox_map,
+        use_bbox_mask=True,
+    )
