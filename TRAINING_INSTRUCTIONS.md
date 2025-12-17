@@ -44,18 +44,24 @@ python -m neu_det_pipeline.cli train-lora D:\VScode\lora\NEU-DET --lora-dir outp
 - 关键超参（可在 `config.yaml` 覆盖）：rank/alpha=8、lr=1e-4、steps=40、batch_size=1~2。
 - 输出：`outputs/lora/lora.safetensors` 与 `lora_training_metrics.json`、`lora_config.json`。
 
-### Step 4 · CLIP 提示生成（论文风格关键词）
+### Step 4 · 提示词生成
+
+#### 方法 A：//简单拼接
 ```powershell
 python -m neu_det_pipeline.cli caption D:\VScode\lora\NEU-DET --output-file outputs/captions.json
+#### 方法B clip选择
+```python -m neu_det_pipeline.cli caption D:\VScode\lora\NEU-DET `
+  --output-file outputs/captions_clip_selected.json `
+  --use-clip-selection ```
+
+#### 方法 C：BLIP-2 动态提示词生成（推荐，更高质量）
+python -m neu_det_pipeline.cli caption D:\VScode\lora\NEU-DET `
+  --output-file outputs/captions_blip2.json `
+  --use-blip2 `
+  --blip2-model Salesforce/blip2-opt-2.7b `
+  --combine-with-keywords
 ```
-- **论文方法**：使用 CLIP textual inversion 从缺陷数据集生成关键词
-- **关键词选择**：按频率排序，选择前 40% 的高频关键词
-- **提示词格式**：将关键词与缺陷类别和 LoRA 权重组合
-  ```
-  grayscale, greyscale, hotrolled steel strip, monochrome, no humans, 
-  surface defects, texture, rolled-in scale, loRA:neudet1-v1:1
-  ```
-- **输出**：`outputs/captions.json`（键为样本名，值为论文风格提示词）
+
 
 **论文关键词列表**（已集成）：
 ```
@@ -73,7 +79,13 @@ python -m neu_det_pipeline.cli generate `
   outputs/lora/lora.safetensors `
   --output-dir outputs/generated `
   --caption-file outputs/captions.json `
-  --max-samples 50
+
+python -m neu_det_pipeline.cli generate `
+  D:\VScode\lora\NEU-DET `
+  outputs/guidance `
+  outputs/lora/lora.safetensors `
+  --output-dir outputs/generated `
+  --caption-file outputs/captions_clip_selected.json --max-samples 50
 ```
 python -m neu_det_pipeline.cli generate D:\VScode\lora\NEU-DET D:\VScode\lora\outputs\guidance outputs/lora/lora.safetensors --mode a1 --use-bbox-mask
 
